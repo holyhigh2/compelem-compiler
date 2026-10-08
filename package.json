@@ -1,0 +1,65 @@
+{
+  "name": "@compelem/compiler",
+  "version": "0.30.0-beta.1",
+  "description": "A compiler for compelem",
+  "type": "module",
+  "license": "MIT",
+  "author": "holyhigh2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/holyhigh2/compelem-compiler.git"
+  },
+  "keywords": [
+    "compelem",
+    "compiler",
+    "webcomponents",
+    "vite-plugin",
+    "rolldown",
+    "reactive"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "import": "./dist/vite.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "compelem": ">=0.30.0"
+  },
+  "peerDependenciesMeta": {
+    "compelem": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "magic-string": "^0.30.11"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "happy-dom": "^20.14.5",
+    "myfx": "^2.0.0-beta.2",
+    "rolldown": "^1.2.9",
+    "tsdown": "^0.15.0",
+    "typescript": "^5.7.3",
+    "vite": "^8.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules
+dist
+.tmp-*
+*.log
+.DS_Store
+
+# 测试 / 一次性分析脚本的产物走 `_` 前缀
+_*.txt
+_*.mjs
+package-lock.json
