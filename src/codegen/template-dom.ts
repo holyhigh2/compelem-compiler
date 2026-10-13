@@ -29,10 +29,13 @@ import type { TemplateVarInfo } from '../analyze/template-extract'
 import {
   PLACEHOLDER,
   SVG_NS,
+  parseTemplateTree,
   splitParts,
+  TemplateParseError,
   type TAttr,
   type TElement,
   type TNode,
+  type TText,
   type TVarPart,
 } from '../analyze/template-tree'
 import { camelCase, kebabCase, snakeCase } from 'myfx'
@@ -148,6 +151,13 @@ export function generateBuildTemplate(
   vars: TemplateVarInfo[],
   opts: CodegenOptions,
 ): CodegenResult {
+  // `${html(CONST)}` 静态 HTML 常量：先改树，再决定建树路径。
+  // 顺序不能反 —— canUseInnerHTML / serializeTemplateHTML 都读这棵树，
+  // 片段必须在它们看到之前就已经是树的一部分（见 inlineStaticFragments 的两条理由）。
+  const fragRes = inlineStaticFragments(root, vars)
+  if (fragRes.errors.length) {
+    return { code: null, errors: fragRes.errors.map((m) => `[${opts.className}] ${m}`) }
+  }
   const html = !opts.forceCreate && canUseInnerHTML(root)
   const ctx: Ctx = {
     L: [],
@@ -227,6 +237,92 @@ function emitNode(ctx: Ctx, nd: TNode, parentVar: string, parentPath: number[], 
   if (nd.type === 'element') emitElement(ctx, nd, parentVar, parentPath, sib)
   else if (nd.type === 'text') emitText(ctx, nd, parentVar, parentPath, sib)
   else emitComment(ctx, nd, parentVar, parentPath, sib)
+}
+
+/**
+ * `${html(CONST)}` 静态 HTML 常量：把该串**解析成节点、就地拼进建树前的模板树**。
+ *
+ * ## 为什么是「改树」而不是「在运行期 splice」
+ * `html` 快路径的产物是 `t.innerHTML = serializeTemplateHTML(root)` —— 序列化的是
+ * **树**。若只在运行期 `anchor.before(fragment)`：
+ *   ① innerHTML 串里没有它 ⇒ 该模式下整块消失；
+ *   ② `updatePaths`（childNodes 下标链）会因插入的兄弟节点整体错位。
+ * 在建树前就成为树的一部分，则 canUseInnerHTML / serializeTemplateHTML / nodeSn /
+ * paths / nodes 全部照常派生，**两条建树路径（html / create）自动都正确**。
+ *
+ * 未命中的常量（跨文件 / 含大写 / 非 const）根本不进这里 —— 它照常是 `html` 指令点，
+ * 走运行期 `Html` 指令，语义与折叠路径等价（折叠子集限定为无大写，见 analyze 侧论证）。
+ *
+ * ## 编号契约
+ * 片段节点是普通静态节点（占 nodeSn、进 nodes[]）；但它**不占 varIndex、不产生
+ * ups / fx / pointEffects** —— 静态串无绑定，运行期无任何事要做。
+ * build-vars 同步跳过该 var（两边共用 `fragment` 标记）⇒ `exprs` 与 `ups` 仍 1:1。
+ *
+ * ## 顺带的文本分裂
+ * 含插值的文本节点在这里按 `emitText` 的同一套规则先分裂（静态段 trim、纯空白段丢弃），
+ * 使下游 `emitText` 见到的是「无插值」或「单插值」的文本节点 —— 与原路径产生的
+ * nodeSn / paths / sib 序列完全一致，空白静态段也照原样丢弃（不会多出空文本节点）。
+ *
+ * @returns 是否发生了折叠；`errors` 非空时调用方应中止生成。
+ */
+function inlineStaticFragments(
+  root: TNode[],
+  vars: TemplateVarInfo[],
+): { folded: boolean; errors: string[] } {
+  const errors: string[] = []
+  let folded = false
+
+  const inlineText = (nd: TText): TNode[] | undefined => {
+    if (!nd.parts.some((p: any) => p.type === 'var')) return undefined
+    const parts = splitParts(nd.raw.trim())
+    const out: TNode[] = []
+    let sawFragment = false
+    for (const p of parts) {
+      if (p.type === 'static') {
+        const t = p.text.trim()
+        if (!t) continue
+        out.push({ type: 'text', raw: t, parts: [{ type: 'static', text: t }] })
+        continue
+      }
+      const frag = vars[p.index]?.fragment
+      if (frag !== undefined) {
+        sawFragment = true
+        try {
+          // varCount = 0：静态串内不可能有插值（否则就是模块常量而非 html 实参）
+          out.push(...parseTemplateTree(frag, 0).root)
+        } catch (e) {
+          errors.push(
+            `静态 HTML 常量（插值 #${p.index}）解析失败：${e instanceof TemplateParseError ? e.message : String(e)}`,
+          )
+        }
+        continue
+      }
+      out.push({ type: 'text', raw: PLACEHOLDER + p.index, parts: [{ type: 'var', index: p.index }] })
+    }
+    return sawFragment ? out : undefined
+  }
+
+  /** 就地替换 children 里的文本节点。返回是否改动。 */
+  const walkChildren = (children: TNode[]): boolean => {
+    let changed = false
+    for (let i = 0; i < children.length; i++) {
+      const nd = children[i]
+      if (nd.type === 'element') {
+        if (walkChildren(nd.children)) changed = true
+        continue
+      }
+      if (nd.type !== 'text') continue
+      const rep = inlineText(nd)
+      if (!rep) continue
+      children.splice(i, 1, ...rep)
+      i += rep.length - 1
+      changed = true
+    }
+    return changed
+  }
+
+  folded = walkChildren(root)
+  return { folded, errors }
 }
 
 function emitComment(ctx: Ctx, nd: { type: 'comment'; text: string }, parentVar: string, _parentPath: number[], sib: { i: number }) {

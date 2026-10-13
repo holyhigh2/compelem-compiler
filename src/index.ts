@@ -2,7 +2,7 @@
  * @compelem/compiler — 编译器
  */
 export { analyzeFile, collectCompelemImports, isCompelemSource } from './analyze/component'
-export { decideDegrade, StaticAnalysisError } from './analyze/degrade'
+export { assertStaticAnalysis, StaticAnalysisError } from './analyze/static-gate'
 export { analyzeRender } from './analyze/render-body'
 export type { RenderAnalysis } from './analyze/render-body'
 export { buildStaticLiteral, injectInto } from './codegen/inject'

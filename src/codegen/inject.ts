@@ -11,9 +11,7 @@ import type { ComponentAnalysis } from '../types'
 import { DEBUG_DIV } from '../types'
 
 export interface InjectOptions {
-  /** 是否生成取值函数 */
-  buildVars?: boolean
-  /** 无视图组件标记：注入 noView: true（不创建 Shadow DOM） */
+  /** 无视图组件标记：注入 noView: true（不创建 Shadow DOM）*/
   noView?: boolean
 }
 
@@ -29,6 +27,8 @@ export interface StaticLiteralCodes {
   fx?: string
   /** watch effect 工厂数组 */
   watchEffects?: string
+  /** `entries` 是否已内联**同文件**基类的 @watch —— 决定 watchEffects 是否还拼父类数组 */
+  inlinedWatchAncestors?: boolean
   /** cssVars effect 工厂（读 CSS 依赖信号 → 更新自定义属性） */
   cssEffect?: string
   /** 结构指令元数据占位字段，运行时从不读取（分派参数在 pointEffects 内） */
@@ -37,12 +37,7 @@ export interface StaticLiteralCodes {
   /** 子视图表（结构指令的子模板元数据）：`subViews: { <subId>: { buildTemplate, fx } }` */
   subViews?: string
   /**
-   * 抽出的表达式中用到的 `super.METHOD` 名。注入到 class 体：
-   * `__ce_s_METHOD(...a){return super.METHOD(...a)}`，
-   * 保留 home-object 的 super 绑定，供静态取值函数经 `__comp` 调用。
-   */
-  superHelpers?: string[]
-  /** `__ce_static__.props` 字面量值（@prop 前移，analyze/field-extract.ts） */
+   /** `__ce_static__.props` 字面量值（@prop 前移，analyze/field-extract.ts） */
   props?: string
   /** `__ce_static__.states` 字面量值（@state 前移） */
   states?: string
@@ -72,7 +67,13 @@ export function planCtorInsert(
   clsNode: any,
   code: string,
 ): CtorInsertPlan | undefined {
-  const braceIdx = code.indexOf('{', comp.start)
+  // 与 injectInto 同理：定位类体左花括号必须优先用 AST 的 `cls.body.start`。
+  // 从 class 起始处往后扫第一个 `{` 会扫进 `extends mixin({ a: 1 })` 的对象字面量，
+  // 把构造体插进那个对象里 —— 模块直接语法错误（mixin 工厂内的组件必中）。
+  const braceIdx =
+    comp.bodyStart >= 0 && comp.bodyStart < comp.end
+      ? comp.bodyStart
+      : code.indexOf('{', comp.start)
   if (braceIdx < 0 || braceIdx > comp.end) return undefined
   const ctor = (clsNode?.body?.body ?? []).find(
     (m: any) => m.type === 'MethodDefinition' && m.kind === 'constructor',
@@ -145,6 +146,32 @@ export function emitFamily(name: 'props' | 'states' | 'computedGetters', ownCode
   return ownCode === undefined ? sup : `{ ...${sup}, ...${ownCode} }`
 }
 
+/**
+ * `watchEffects` 的 emit 形态 —— **数组拼接**语义（props/states 是浅替换，语义相反）。
+ *
+ * @watch effect 是**要执行的行为**而非可替换的表：子类 own 数组必须把祖先的执行
+ * 序列接在**自己前面**，而不是覆盖掉它。
+ *
+ * ⚠️ own `__ce_static__` 会**遮蔽**父类整个静态对象，漏 emit 即丢祖先全部 @watch。
+ * 实测（compelem-ui，2026-10）：`Input → BaseInput → ControlBox → FormControl →
+ * AppearanceElem` 每层都跨文件，`AppearanceElem` 的 5 个 immediate watch 全部未执行 ——
+ * 其中 `__watchSRB` 正是把 `--border-size` / `--round-size` / `--shadow-size`
+ * 写上宿主 inline style 的那个。`ce-input` 宿主因此没有 `--border-size`，
+ * `form/input/input.scss` 的 `border-width: var(--border-size)` 在 computed-value
+ * time 无效 → 回退到 initial 值 `medium` = 3px 边框。
+ *
+ * @param ownCode 本类 @watch 生成的数组字面量（`[...]`）；无则 undefined
+ * @param inlinedAncestors `entries` 是否已内联**同文件**基类的 @watch。
+ *   为 true 时原样返回 ownCode：同文件继承由 watch-extract 把祖先条目并入 entries，
+ *   而父类 `__ce_static__.watchEffects` 与该前缀内容完全相同，拼接会让同一批
+ *   处理器执行两次（immediate 处理器副作用翻倍）。
+ */
+export function emitWatchEffects(ownCode?: string, inlinedAncestors?: boolean): string | undefined {
+  if (inlinedAncestors) return ownCode
+  const sup = `(${SUPER_STATIC}?.watchEffects ?? [])`
+  return ownCode === undefined ? `[...${sup}]` : `[...${sup}, ...${ownCode}]`
+}
+
 /** 生成 `static __ce_static__ = {...}` 的源码文本。 */
 export function buildStaticLiteral(
   opts: InjectOptions,
@@ -166,17 +193,23 @@ export function buildStaticLiteral(
     parts.push(mark('subViews', `subViews: ${codes.subViews}`))
   }
 
-  // ---- 五族访问器前移（field-extract）：与降级无关，必须注入 ----
+  // ---- 五族访问器前移（field-extract）：与视图无关，必须注入 ----
   // props/states/computedGetters 一律 emit（own 浅替换叠加父类表，见 emitFamily）：
   // own 静态字面量会遮蔽父类整张表，漏 emit 即丢祖先定义。
   parts.push(mark('props', `props: ${emitFamily('props', codes.props)}`))
   parts.push(mark('states', `states: ${emitFamily('states', codes.states)}`))
   parts.push(mark('computedGetters', `computedGetters: ${emitFamily('computedGetters', codes.computedGetters)}`))
 
-  if (codes.watchEffects) {
-    // watch effect 工厂数组。
+  // watchEffects 与 props/states 的 emit 形态**不同**：那边是浅替换，这边是拼接
+  // （effect 是要执行的行为，own 数组必须把祖先的执行序列接在自己前面）。
+  // 同样「无论哪种都必须 emit」—— own `__ce_static__` 遮蔽父类整个静态对象，
+  // 漏 emit 即丢祖先全部 @watch。inlinedWatchAncestors 为真时返回 undefined
+  // （不注入 own 键），让父类数组原样透下来。
+  const watchCode = emitWatchEffects(codes.watchEffects, codes.inlinedWatchAncestors)
+  if (watchCode !== undefined) {
+    // watch effect 工厂数组（祖先在前、自己在后）。
     // 每个工厂 (rc) => effectFn：读信号 → 变更时调用处理器。
-    parts.push(mark('watchEffects', `watchEffects: ${codes.watchEffects}`))
+    parts.push(mark('watchEffects', `watchEffects: ${watchCode}`))
   }
 
   if (codes.cssEffect) {
@@ -197,8 +230,8 @@ if (codes.pointEffects) {
     parts.push(mark('fx', `fx: ${codes.fx}`))
   }
 
-  // `diag` 不注入产物：降级信息只经 `compileResult.diagnostics` 出口
-  // （按类记录，每条带 `degraded` 与 `reason`）。**不要把降级信息写进产物**。
+  // 静态分析结论**不注入产物**：未通过的组件由 `assertStaticAnalysis` / 模板 codegen
+  // 直接抛 `StaticAnalysisError`，走不到这里。产物里只留运行时需要的东西。
 
   if (opts.noView) {
     // 无视图组件：只注入 noView，不注入任何视图加速字段
@@ -208,18 +241,7 @@ if (codes.pointEffects) {
   }
 
   let literal = wrap(parts)
-  // super 转发方法：仅当某处抽出的表达式用到 super.METHOD 时注入。
-  //
-  // ⚠️ 判据只看 `codes.superHelpers` 是否非空：它已经是**全量汇流**
-  // （compile.ts 把子模板的 superHelpers 与 fx 内联时的都 push 进同一数组）。
-  if (codes.superHelpers?.length) {
-    literal += `${DEBUG_DIV} super-forwarders\n`
-    for (const name of codes.superHelpers) {
-      if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue
-      literal += `__ce_s_${name}(...__a){return super.${name}(...__a)}\n`
-    }
-  }
-  // 访问器（get/set/observedAttributes）：与 super 转发方法同批 appendLeft
+  // 访问器（get/set/observedAttributes）
   literal += codes.accessors ?? ''
   return literal
 }

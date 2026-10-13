@@ -1,4 +1,4 @@
-/**
+﻿/**
  * cssVars / @computed getter 的响应式依赖静态提取（编译期静态分析）。
  *
  * 语义（只收集响应式读取；宁可省略键走全根兜底，不可欠收集）：
@@ -14,11 +14,14 @@
  *     ② queryFields（@query/@queryAll，非响应式）→ 记录死条目
  *     ③ own bodies（方法/普通 getter/箭头字段）→ 内联扫体（不记 root，inlineDepth ≤ 8 防环）
  *     ④ 同文件祖先（localClasses + classInfoOf 记忆）→ 同级处理
- *     ⑤ 未知（跨文件基类成员、mixin 链、this.slots、super 等）→ 放弃该 getter
+ *     ⑤ 未知（跨文件基类成员、mixin 链等）→ 放弃该 getter
  *  4. 调用表达式：callee 为 this/别名链 → 按③分级；自由/模块/局部 callee → 只扫实参
  *     （模块函数的 this 非组件实例）；FunctionExpression/Declaration 体内含 this → 放弃。
  *  5. 自由/局部/形参/模块标识符一律忽略（非响应式读取不收集）。
  *  6. 嵌套箭头共享 this 等价类，词法下钻。
+ *  7. `super.cssVars`：沿**同文件** super 链取第一个定义了 cssVars 的祖先，内联扫其体
+ *     （父类 cssVars 的依赖就是本组件的依赖，见 scanNode 的 Super 分支）。链上有跨文件
+ *     基类时仍不可知 —— 其 cssVars 体不在这份 AST 里。
  *
  * 失败语义：cssVars 任一失败 → 整体 undefined（不注入，运行时全根兜底）；
  * @computed 失败键跳过（该键运行时全根兜底），全部失败 → 注入空对象；无 @computed → undefined。
@@ -26,7 +29,7 @@
  * 调试：环境变量 DEPS_TRACE=1 时每次失败向 stderr 输出 `[deps-fail] <原因标签>`。
  */
 import type { ComponentAnalysis } from '../types'
-import { keyName } from '../utils/oxc'
+import { isTsWrapper, keyName, unwrapExpr } from '../utils/oxc'
 import { classInfoOf, superClassName } from './component'
 
 interface ExtractCtx {
@@ -43,6 +46,15 @@ interface ExtractCtx {
   seen: WeakSet<object>
   /** 内联扫体深度（防环） */
   depth: number
+  /**
+   * 当前正在展开其成员体的类节点（默认 = 本组件自己的类节点）。
+   *
+   * `super.cssVars` 的解析必须从**它所在的那个类**往上走，而不是每次都从本组件重新开始 ——
+   * 否则「父类的 cssVars 自己又写 `super.cssVars`」时，递归会原地打转、永远够不到祖父类
+   * （实测：三级链 `A ← B ← Foo`，B 与 Foo 都 `assign(super.cssVars, …)`，Foo 的依赖集
+   * 会丢掉 A 的字段）。内联扫体时按栈式保存/恢复，见 inlineScan。
+   */
+  ownerClass: any
 }
 
 function record(ctx: ExtractCtx, path: string[]) {
@@ -51,22 +63,8 @@ function record(ctx: ExtractCtx, path: string[]) {
   if (path.length > 1) ctx.deps.add(path[0])
 }
 
-/** TS 包装节点解包（`this as any` / `that!` 等） */
-function isTsWrapper(node: any): boolean {
-  const t = node?.type
-  return (
-    t === 'TSAsExpression' ||
-    t === 'TSSatisfiesExpression' ||
-    t === 'TSNonNullExpression' ||
-    t === 'TSInstantiationExpression' ||
-    t === 'ParenthesizedExpression'
-  )
-}
-function unwrapTs(node: any): any {
-  let cur = node
-  while (cur && isTsWrapper(cur)) cur = cur.expression
-  return cur
-}
+/** TS 包装节点解包（`this as any` / `that!` 等）—— 统一实现在 utils/oxc#unwrapExpr。
+ *  本副本原先比别处多认 `TSInstantiationExpression`、少认 `TSTypeAssertion`，已归一。 */
 
 /** 置失败标记；DEPS_TRACE=1 时输出原因标签（见文件头）。 */
 function failAt(ctx: ExtractCtx, where: string) {
@@ -164,7 +162,7 @@ function prescanBody(ctx: ExtractCtx, nodes: any[]): void {
       return
     }
     if (t === 'VariableDeclarator') {
-      const init = unwrapTs(node.init)
+      const init = unwrapExpr(node.init)
       if (init) {
         if (init.type === 'ThisExpression') {
           ctx.exemptThis.add(init)
@@ -174,7 +172,7 @@ function prescanBody(ctx: ExtractCtx, nodes: any[]): void {
         }
       }
     } else if (t === 'AssignmentExpression') {
-      const right = unwrapTs(node.right)
+      const right = unwrapExpr(node.right)
       if (right && node.left?.type === 'Identifier') {
         if (right.type === 'ThisExpression') {
           ctx.exemptThis.add(right)
@@ -216,7 +214,7 @@ function prescanBody(ctx: ExtractCtx, nodes: any[]): void {
  * `null`（非 this/别名 起始）。遇到中间 computed 止步于前缀（更深下标由 scanChainRemainders 扫描）。
  */
 function resolveChain(ctx: ExtractCtx, node: any): { path: string[] | null } | null {
-  let cur = unwrapTs(node)
+  let cur = unwrapExpr(node)
   if (cur.type === 'ThisExpression') return { path: [] }
   if (cur.type === 'Identifier' && ctx.aliasNames.has(cur.name)) return { path: [] }
   if (cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression') {
@@ -245,6 +243,8 @@ function applyLevel(
     bodies?: Map<string, any>
     methods?: Set<string>
     getters?: Set<string>
+    /** 该 level 对应的类节点（③ 级内联扫体时作为 `super` 的解析起点） */
+    owner?: any
   },
   path: string[],
 ): 'hit' | 'miss' | 'fail' {
@@ -258,16 +258,36 @@ function applyLevel(
     return 'hit'
   }
   if (level.bodies?.has(root)) {
-    inlineScan(ctx, level.bodies.get(root))
+    inlineScan(ctx, level.bodies.get(root), level.owner)
     return 'hit' // 内联扫体，不记 root
   }
   if (level.methods?.has(root) || level.getters?.has(root)) return 'fail' // 有名无体 → 未知
   return 'miss'
 }
 
-/** 链根五级分级：① own → ② query → ③ own bodies → ④ 同文件祖先 → ⑤ 未知失败。 */
+/**
+ * `CompElem` 运行时基类自带的响应式信号根（=`__s` 的键）。
+ *
+ * 基类不经过本编译器，其字段对静态分析完全不可见 ⇒ `this.slots.x` 的链根 `slots`
+ * 在五级分级里全部 miss（own 无 / 祖先查不到 / 非跨文件判定）⇒ `unknown-root`
+ * ⇒ **整个 cssVars 退到运行期全根兜底**。而 `slots` 恰恰是响应式的
+ * （`CompElem.#slotsSig()` → `s.slots = signal(...)`，CompElem.ts:1005-1006），
+ * 静态完全可定 —— 不该为一个已知信号付出「每轮遍历并订阅全部信号」的代价。
+ *
+ * ⚠️ 只收**确实落在 `__s` 上**的键。`@query`/`@queryAll` 不是信号，绝不能进来 ——
+ * 那类根由 ② 级（`queryFields`）负责，记为「死条目」，codegen 侧用 `?.` 兜住。
+ */
+const BASE_SIGNAL_ROOTS: ReadonlySet<string> = new Set(['slots'])
+
+/** 链根五级分级：⓪ 基类内建信号 → ① own → ② query → ③ own bodies → ④ 同文件祖先 → ⑤ 未知失败。 */
 function classifyPath(ctx: ExtractCtx, path: string[]): void {
   const comp = ctx.comp
+  // ⓪ 基类内建信号（`slots`）——先于 own 判定：它不可能出现在任何用户类的 fields 里，
+  //    但必须能被认出来，否则整条链掉进 ⑤ 级全根兜底。
+  if (BASE_SIGNAL_ROOTS.has(path[0])) {
+    record(ctx, path)
+    return
+  }
   const own = applyLevel(
     ctx,
     {
@@ -276,6 +296,7 @@ function classifyPath(ctx: ExtractCtx, path: string[]): void {
       bodies: comp.bodies,
       methods: comp.ownMethods,
       getters: comp.ownGetters,
+      owner: comp.cls ?? ctx.localClasses.get(comp.className),
     },
     path,
   )
@@ -305,6 +326,7 @@ function classifyPath(ctx: ExtractCtx, path: string[]): void {
         bodies: info.bodies,
         methods: info.methods,
         getters: info.getters,
+        owner: parent,
       },
       path,
     )
@@ -314,7 +336,42 @@ function classifyPath(ctx: ExtractCtx, path: string[]): void {
     }
     node = parent
   }
-  failAt(ctx, 'unknown-root') // 五级尽未命中（含 this.slots / super）→ 该键省略 → 运行时全根兜底
+  failAt(ctx, 'unknown-root') // 五级尽未命中 → 该键省略 → 运行时全根兜底
+}
+
+/**
+ * `super.cssVars` 的依赖内联：沿**同文件** super 链找第一个定义了 `cssVars` 的祖先，
+ * 内联扫它的体（语义见 scanNode 的 Super 分支注释）。
+ *
+ * 三种走到 `failAt` 的情形，都只能靠跨文件解析才能解决，本版本不做：
+ *   1. 链上有**跨文件**基类 —— 它的 cssVars 体不在这份 AST 里；
+ *   2. 同文件链上**无人**定义 cssVars（链终 CompElem，其 `render()` 返回 null、
+ *      也不参与编译，没有产物可继承）；
+ *   3. 递归超限（父类 cssVars 里又 `super.cssVars`，由 inlineScan 的 depth 守卫兜住）。
+ */
+function inlineScanSuperCssVars(ctx: ExtractCtx): void {
+  let node: any = ctx.ownerClass
+  const seenCls = new Set<any>()
+  for (let i = 0; node && i < 8; i++) {
+    const sup = superClassName(node)
+    if (!sup) break
+    if (ctx.aliases.has('CompElem') && sup === 'CompElem') break // 链终点：基类无 cssVars 体
+    const parent = ctx.localClasses.get(sup)
+    if (!parent) {
+      failAt(ctx, 'cross-file')
+      return
+    }
+    if (seenCls.has(parent)) break
+    seenCls.add(parent)
+    const body = classInfoOf(parent, ctx.aliases).cssVarsBody
+    if (body && body.length) {
+      // 递归的 `super.cssVars` 必须从 **parent** 继续往上找，而不是回到本组件
+      inlineScan(ctx, body, parent)
+      return
+    }
+    node = parent
+  }
+  failAt(ctx, 'super-cssVars')
 }
 
 // ---------------------------------------------------------------------------
@@ -366,12 +423,19 @@ function scanChainRemainders(ctx: ExtractCtx, node: any): void {
 
 function toStatements(bodyNode: any): any[] {
   if (!bodyNode) return []
+  if (Array.isArray(bodyNode)) return bodyNode // cssVarsBody 已是语句数组（见 §super.cssVars）
   if (bodyNode.type === 'BlockStatement') return bodyNode.body ?? []
   return [{ type: 'ExpressionStatement', expression: bodyNode }]
 }
 
-/** 内联扫体：方法/getter/箭头字段的函数体直接展开扫描（不记 root）。 */
-function inlineScan(ctx: ExtractCtx, bodyNode: any): void {
+/**
+ * 内联扫体：方法/getter/箭头字段的函数体直接展开扫描（不记 root）。
+ *
+ * @param owner 该体**所属的类节点**（祖先的体传祖先自己）。体内若出现
+ *   `super.cssVars`，解析要从这个类继续往上走，故按栈式保存/恢复 `ctx.ownerClass`。
+ *   省略 = 体属于 `ctx.ownerClass` 当前指向的类。
+ */
+function inlineScan(ctx: ExtractCtx, bodyNode: any, owner?: any): void {
   if (ctx.failed) return
   if (ctx.depth >= 8) {
     failAt(ctx, 'depth') // 深度超限（递归调用环）→ 保守放弃
@@ -379,12 +443,15 @@ function inlineScan(ctx: ExtractCtx, bodyNode: any): void {
   }
   ctx.depth++
   const snapAlias = new Set(ctx.aliasNames)
+  const snapOwner = ctx.ownerClass
+  if (owner !== undefined) ctx.ownerClass = owner
   try {
     const nodes = toStatements(bodyNode)
     prescanBody(ctx, nodes)
     for (const stmt of nodes) scanNode(ctx, stmt, null)
   } finally {
     ctx.aliasNames = snapAlias
+    if (owner !== undefined) ctx.ownerClass = snapOwner
     ctx.depth--
   }
 }
@@ -409,8 +476,23 @@ function scanNode(ctx: ExtractCtx, node: any, parent: any): void {
     // 无 this → 参数/体可安全下钻（通用规则）
   }
 
-  // --- super：组件外基类成员 → 未知 ---
+  // --- super：仅 `super.cssVars` 可解（同文件父类），其余成员一律未知 ---
   if (node.type === 'Super') {
+    // 典型形态：`assign(super.cssVars, {…})`（compelem-ui 的 `Editable`）。
+    // 父类 cssVars 的响应式依赖**就是本组件的依赖** —— 合并后的返回值由父类那份
+    // 决定，所以直接内联扫父类的 cssVars 体即可，父类体就在手边（同文件），
+    // **不需要跨文件解析**。此前这里对所有 `super` 一律 failAt，白白让这类组件
+    // 整个 cssVars 退到运行期全根兜底。
+    const m = parent
+    const isCssVars =
+      m &&
+      (m.type === 'MemberExpression' || m.type === 'OptionalMemberExpression') &&
+      m.object === node &&
+      keyName(m.property) === 'cssVars'
+    if (isCssVars) {
+      inlineScanSuperCssVars(ctx)
+      return
+    }
     failAt(ctx, 'super')
     return
   }
@@ -487,6 +569,7 @@ function runExtract(
     failed: false,
     seen: new WeakSet<object>(),
     depth: 0,
+    ownerClass: comp.cls ?? (localClasses ?? new Map()).get(comp.className),
   }
   prescanBody(ctx, body)
   for (const stmt of body) scanNode(ctx, stmt, null)

@@ -1,6 +1,6 @@
 {
   "name": "@compelem/compiler",
-  "version": "0.30.0-beta.1",
+  "version": "0.30.0-beta.2",
   "description": "A compiler for compelem",
   "type": "module",
   "license": "MIT",

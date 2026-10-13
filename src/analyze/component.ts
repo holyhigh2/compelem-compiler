@@ -1,18 +1,9 @@
 /**
  * 组件识别与响应式字段提取。
- *
- * 目标：从单个 `.ts` 源文件里找出所有 compelem 组件类，并提取
- *   - 响应式字段白名单（@prop / @state / @computed）
- *   - 本类自有方法 / getter（D2 降级判定用）
- *   - render() 函数体 AST 与偏移
- *   - 从 compelem 导入的绑定名（D3 白名单）
- *
- * ⚠️ 前提：本仓库（compelem）自身 dev 用 `'../src/index'` 这种相对路径导入，
- * 因此 compelem 判定必须同时接受「包名含 compelem」与「相对路径指向 src」两种形态。
  */
 import type { ComponentAnalysis, ReactiveField, ReactiveKind } from '../types'
-import { keyName, topLevelReturns } from '../utils/oxc'
 import type { ParsedFile } from '../utils/oxc'
+import { keyName, topLevelReturns } from '../utils/oxc'
 
 /** 判断某个 import source 是否指向 compelem 本体。 */
 export function isCompelemSource(source: string): boolean {
@@ -27,10 +18,6 @@ export function isCompelemSource(source: string): boolean {
 
 /**
  * 判断某个 import source 是否指向 **myfx**。
- *
- * 编译器为方法装饰器前移注入的 `debounce/throttle/once` 走这条通道：它们是 myfx 的
- * 实现，compelem 不再为它们开出口（主项目直接依赖 myfx 即可）。
- * 接受包名（`myfx`）与仓库内常见的相对/别名形态（`../myfx/src`、`@/myfx`）。
  */
 export function isMyfxSource(source: string): boolean {
   return /(^|[/@])myfx([/@]|$)|myfx\//.test(source)
@@ -79,6 +66,30 @@ function collectDeclNames(stmt: any, into: Set<string>) {
   }
 }
 
+/**
+ * 收集**模块级 `const`** 的初始化器 AST：名字 → VariableDeclarator。
+ *
+ * 与 {@link collectModuleBindings} 的区别：后者只收名字（用于自由标识符放行），
+ * 这里收**初始化器**，供模板静态片段折叠（`${CONST}`）判定「该标识符是不是一个
+ * 模块级 `h` 标签模板常量」。
+ *
+ * 收窄到 `const` 是刻意的：`let`/`var` 可被重新赋值，折叠会把某次运行的值固化进
+ * 产物，语义与源码不符。跨文件 import 不收 —— compileFile 是单文件纯函数。
+ */
+export function collectModuleConstInits(parsed: ParsedFile): Map<string, any> {
+  const out = new Map<string, any>()
+  for (const stmt of parsed.program.body ?? []) {
+    const decl = stmt.type === 'ExportNamedDeclaration' || stmt.type === 'ExportDefaultDeclaration'
+      ? stmt.declaration
+      : stmt
+    if (decl?.type !== 'VariableDeclaration' || decl.kind !== 'const') continue
+    for (const d of decl.declarations ?? []) {
+      if (d.id?.type === 'Identifier' && d.id.name && d.init) out.set(d.id.name, d)
+    }
+  }
+  return out
+}
+
 function collectPatNames(pat: any, into: Set<string>) {
   if (!pat) return
   switch (pat.type) {
@@ -103,37 +114,10 @@ function collectPatNames(pat: any, into: Set<string>) {
   }
 }
 
-/** 组件类的候选：有 decorator 或继承自 CompElem。 */
-interface ClassCandidate {
-  node: any
-  className: string
-  decorators: string[]
-  isCompElemSubclass: boolean
-}
-
-function decoratorName(dec: any): string | null {
-  const expr = dec?.expression ?? dec
-  if (!expr) return null
-  // @tag("x") / @prop({...}) → CallExpression
-  if (expr.type === 'CallExpression') {
-    const callee = expr.callee
-    if (callee?.type === 'Identifier') return callee.name
-    if (callee?.type === 'MemberExpression' && callee.property?.type === 'Identifier') return callee.property.name
-    return null
-  }
-  // @computed → Identifier
-  if (expr.type === 'Identifier') return expr.name
-  return null
-}
-
-function superClassName(node: any): string | null {
-  const sc = node.superClass
-  if (!sc) return null
-  if (sc.type === 'Identifier') return sc.name
-  if (sc.type === 'MemberExpression' && sc.property?.type === 'Identifier') return sc.property.name
-  return null
-}
-export { superClassName }
+/** 装饰器本地名与基类名的统一实现见 utils/oxc（此前本文件与 conventions /
+ * template-rules 各抄了一份，已漂移）。这里转出以维持既有 import 路径。 */
+import { decoratorName, superClassName } from '../utils/oxc'
+export { decoratorName, superClassName }
 
 /** 提取 render() 方法的函数体与偏移。 */
 function extractRenderBody(node: any): { body: any; start: number; end: number } | null {
@@ -392,6 +376,7 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
 
   const out: ComponentAnalysis[] = []
   const moduleBindings = collectModuleBindings(parsed)
+  const moduleConstInits = collectModuleConstInits(parsed)
   // 顶层 class（按名索引）+ mixin class（函数作用域，按数组）统一成一份工作表处理
   const worklist: Array<{ className: string; cls: any; isMixin: boolean }> = [
     ...[...localClasses].map(([className, cls]) => ({ className, cls, isMixin: false })),
@@ -411,8 +396,20 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
     const byDecorator = hasCompelemFamilyDecorator(cls, aliases)
     const sub = isSub(cls)
     if (!sub && !decs.includes('tag') && !byDecorator) continue
-    /** 仅靠「带家族装饰器」准入 ⇒ super 链不可知（mixin 形参 / 跨文件基类） */
-    const unknownSuperAdmitted = !sub && !decs.includes('tag') && byDecorator
+    /**
+     * super 链不可知（mixin 形参 / 跨文件基类）⇒ 无 own render() 时一律 skipInjection。
+     *
+     * ⚠️ `@tag` **不参与**本判据（曾经参与，是错的）：`@tag` 只是自定义元素注册登记，
+     *    它不改变「super 在别的文件、编译器无法判断基类有没有 render」这一事实。
+     *    把 @tag 类排除在外会让「跨文件基类 + 有 render() 的类」在无 own render 时
+     *    落到 component.ts:492 的 D0 阻断 —— 而 §跨文件基类不得阻断构建 的论证
+     *    （见本函数下方 D0 拆分注释与 AGENTS.md）对 @tag 类同样成立。
+     *    典型反例：compelem-ui 的 `@tag("ce-editable") class Editable extends Table`，
+     *    基类 Table 在 ./Table.ts，Editable 只补行为不重写骨架 ⇒ 必须继承基类视图。
+     *    失败形态仍是**可诊断**的：基类无视图时 spread 得到空 → 退化为「无静态视图」→
+     *    DEV 报错，与未编译组件同路径；绝不会静默白屏。
+     */
+    const unknownSuperAdmitted = !sub && byDecorator
 
     const { fields, queryFields, methods, getters, bodies, render, cssVarsBody, computedBodies } = classInfoOf(cls, aliases)
     const tagDec = (cls.decorators ?? []).find((d: any) => decoratorName(d) === 'tag')
@@ -425,7 +422,7 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
       }
     }
 
-    let degradeReason: string | null = null
+    let staticReason: string | null = null
     let noView = false
     let skipInjection = false
 
@@ -433,8 +430,8 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
       // D0 拆分：无 own render() 时，沿同文件继承链向上找；
       //  - 链上有 render → skipInjection（不注入，继承父类 __ce_static__，静态字段经构造器原型链继承）
       //  - 链终于 CompElem（其 render() 返回 null）→ noView: true 注入（无视图组件）
-      //  - 链终于未知跨文件基类 → D6 降级（→ 报错）
-      //  - @tag 非 CompElem 类 → D0 降级
+      //  - 链终于未知跨文件基类 → D6 阻断（报错）
+      //  - @tag 非 CompElem 类 → D0 阻断（报错）
       //  - **super 链不可知者（mixin 形参 / 仅靠装饰器准入的跨文件基类）→ 一律
       //    skipInjection**（见下）
       const sup = superClassName(cls)
@@ -443,12 +440,12 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
         //   · 判 skipInjection：字面量 spread 继承基类视图字段。基类有视图 → 继承到（正确）；
         //     基类无视图 → spread 得到空，退化为「无静态视图」，DEV 报错，与未编译组件同路径。
         //   · **绝不能判 noView**：noView 会跳过 Shadow DOM 创建；若基类其实有 render，
-        //     组件将静默白屏（无报错、无降级）——这是最坏的失败形态。
+        //     组件将静默白屏（无报错）——这是最坏的失败形态。
         //   · 也**不能**沿用 D6/D0 报错：跨文件基类与 mixin 在真实项目里是常态
         //     （compelem-ui 的 FormControl/BaseInput/ControlBox 即是），阻断构建等于不可用。
         skipInjection = true
       } else if (!sup) {
-        degradeReason = 'D0: 无 render() 或 render 体不是 BlockStatement'
+        staticReason = 'D0: 无 render() 或 render 体不是 BlockStatement'
       } else if (hasCompElemAlias && sup === 'CompElem') {
         noView = true
       } else if (localClasses.has(sup)) {
@@ -483,18 +480,18 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
         if (found) {
           skipInjection = true
         } else if (unknownCrossFile) {
-          degradeReason = `D6: 跨文件继承 render（基类 ${sup} 不在本文件）`
+          staticReason = `D6: 跨文件继承 render（基类 ${sup} 不在本文件）`
         } else {
           // 链终于 CompElem 且整条链无 render → 无视图组件
           noView = true
         }
       } else {
-        degradeReason = `D0: 无 render() 且非 CompElem 子类（基类 ${sup} 不在本文件）`
+        staticReason = `D0: 无 render() 且非 CompElem 子类（基类 ${sup} 不在本文件）`
       }
     } else {
       const rets = topLevelReturns(render.body)
-      if (rets.length === 0) degradeReason = 'D4: render() 内没有顶层 return'
-      else if (rets.length > 1) degradeReason = `D5: render() 有 ${rets.length} 个顶层 return`
+      if (rets.length === 0) staticReason = 'D4: render() 内没有顶层 return'
+      else if (rets.length > 1) staticReason = `D5: render() 有 ${rets.length} 个顶层 return`
     }
 
     out.push({
@@ -515,12 +512,13 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
       renderBodyEnd: render?.end ?? -1,
       cssVarsBody,
       computedBodies,
-      degradeReason,
+      staticReason,
       noView,
       skipInjection,
       isMixin: isMixin || unknownSuperAdmitted,
       compelemImports,
       moduleBindings,
+      moduleConstInits,
     })
   }
   void code

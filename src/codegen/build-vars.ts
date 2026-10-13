@@ -28,12 +28,6 @@ export interface BuildVarsResult {
   code: string | null
   errors: string[]
   /**
-   * 表达式中用到的 `super.METHOD` 名集合：调用点已改写为
-   * `__comp.__ce_s_METHOD(...)`，需在 class 体注入同名转发方法
-   * （保留 home-object 的 super 绑定，供静态取值函数调用）。
-   */
-  superHelpers?: string[]
-  /**
    * 自由标识符（解析成功但 filterFree 拒绝时）——供 C1 判断是否可闭包提升到父级。
    * 仅在 `code == null` 且因自由标识符失败时填充。
    */
@@ -42,7 +36,7 @@ export interface BuildVarsResult {
   lifted?: boolean
   /**
    * 表达式脏依赖映射——根名 → 取值函数输出数组下标；特殊键 `''` 为
-   * **常脏**下标（含动态 this / 未知 getter / 方法或 super 调用 / 不纯自由标识符
+   * **常脏**下标（含动态 this / 未知 getter / 方法调用 / 不纯自由标识符
    * （Date/console/document/window/globalThis）/ 无法解析的表达式），任一视图
    * 更新都重算。与 guarded codegen 配对：取值函数只对 dirty 内下标求值，
    * 其余槽位返回占位值（区间扫描不读）。仅 verbose 依赖清单展示使用。
@@ -185,19 +179,6 @@ export function rewriteThis(src: string, thisName = '__comp'): string | null {
   return out
 }
 
-/**
- * 把表达式中的 `super.METHOD` 改写为 `__comp.__ce_s_METHOD`，
- * 并把 METHOD 收集进 helpers（供 class 体注入 `__ce_s_METHOD(...args){ return super.METHOD(...args) }`）。
- * 仅处理方法调用形态 `super.name(...)` / 方法引用；`super` 本身保留在
- * 原始 render() 内（本函数只用于抽出的静态表达式）。
- */
-export function rewriteSuper(src: string, helpers: Set<string>): string {
-  return src.replace(/\bsuper\.([A-Za-z_$][\w$]*)\s*(?=\()/g, (_m, name: string) => {
-    helpers.add(name)
-    return `__comp.__ce_s_${name}`
-  })
-}
-
 // ---------- 自由标识符校验（oxc AST 精确解析） ----------
 
 /** 表达式 this 链分类收集——roots 命中响应式字段的根名；uncertain 放弃静态分类。 */
@@ -248,19 +229,26 @@ function classifyThisChain(node: any, out: ChainOut, comp?: ComponentAnalysis): 
  *             freeIdentifiersInFn 单独校验），避免把回调闭包误报为主表达式依赖。
  * @param chainOut 可选——同时分类收集 this 链根名（与自由标识符同一次解析）。
  */
-function freeIdentifiers(expr: string, comp?: ComponentAnalysis, chainOut?: ChainOut): Set<string> | null {
-  let ret: any
+function freeIdentifiers(
+  expr: string,
+  comp?: ComponentAnalysis,
+  chainOut?: ChainOut,
+  prelude?: string,
+): Set<string> | null {
+  let fnBody: any
   try {
-    const parsed = parse(`(function(){ return (${expr}) })`, 'buildvars-check.js')
-    const fnBody = parsed.program?.body?.[0]?.expression?.body
-    ret = Array.isArray(fnBody?.body)
-      ? fnBody.body.find((s: any) => s?.type === 'ReturnStatement')?.argument
-      : fnBody?.argument
+    const wrapper = prelude
+      ? `(function(){ ${prelude}\nreturn (${expr}) })`
+      : `(function(){ return (${expr}) })`
+    const parsed = parse(wrapper, 'buildvars-check.js')
+    fnBody = parsed.program?.body?.[0]?.expression?.body
   } catch {
     return null
   }
-  if (!ret) return null
-  return collectFreeWalk(ret, comp, chainOut)
+  if (!fnBody) return null
+  // Walk the entire function body (including prelude) to establish scope,
+  // then the return expression will find prelude-declared variables in scope.
+  return collectFreeWalk(fnBody, comp, chainOut)
 }
 
 /**
@@ -278,9 +266,10 @@ function freeIdentifiersFromNode(
   exprSource: string,
   comp?: ComponentAnalysis,
   chainOut?: ChainOut,
+  prelude?: string,
 ): Set<string> | null {
-  if (!node || typeof node.type !== 'string' || wrapperRisky(node)) {
-    return freeIdentifiers(exprSource, comp, chainOut)
+  if (!node || typeof node.type !== 'string' || wrapperRisky(node) || prelude) {
+    return freeIdentifiers(exprSource, comp, chainOut, prelude)
   }
   return collectFreeWalk(node, comp, chainOut)
 }
@@ -541,20 +530,33 @@ export function generateBuildVars(
   opts?: BuildVarsOptions,
 ): BuildVarsResult {
   const exprs: string[] = []
-  const superHelpers = new Set<string>()
   const hasWraps = source != null && !!candidates?.length
   const extras = opts?.extras
   // 根名/'' → 输出下标脏映射；'' 收集常脏（uncertain/不纯）表达式
   const biMap: Record<string, number[]> = {}
   const alwaysDirty: number[] = []
+
+  // ---- prelude：stripTs → TS 复检 ----
+  const rawPrelude = tmpl.preludeSrc ?? ''
+  let preludeOut = ''
+  if (rawPrelude) {
+    preludeOut = stripTs(rawPrelude)
+    if (TS_SYNTAX_RE.test(preludeOut)) {
+      return { code: null, errors: [`prelude 含 TS 专有语法（as/satisfies/非空断言），放弃注入`] }
+    }
+  }
+
   for (const v of tmpl.vars) {
     const label = `插值 #${v.index}`
+    // `${CONST}` 静态片段：该节点在编译期已被折进建树序列，没有运行期取值。
+    // 与 template-dom 的 emitText 共用 `fragment` 标记，两边同跳 ⇒ varIndex 对齐。
+    if (v.fragment) continue
     // 顺序：raw free-check（跳过模板回调）→ wraps → stripTs → TS 复检 → super 改写 → this 改写
     const chainOut: ChainOut = { roots: new Set(), uncertain: false }
     // U2：模块 AST 节点直达（免 wrapper 重 parse）；节点缺失（手工构造 vars）回退字符串路径
     const free = v.node
-      ? freeIdentifiersFromNode(v.node, v.exprSource, comp, chainOut)
-      : freeIdentifiers(v.exprSource, comp, chainOut)
+      ? freeIdentifiersFromNode(v.node, v.exprSource, comp, chainOut, rawPrelude)
+      : freeIdentifiers(v.exprSource, comp, chainOut, rawPrelude)
     const freeErr = filterFree(free, comp, label, opts?.extraAllowed)
     if (freeErr) {
       return { code: null, errors: freeErr, freeIds: collectRejectedFree(free, comp) }
@@ -578,7 +580,6 @@ export function generateBuildVars(
     if (TS_SYNTAX_RE.test(src)) {
       return { code: null, errors: [`${label} 含 TS 专有语法（as/satisfies/非空断言），放弃注入`] }
     }
-    src = rewriteSuper(src, superHelpers)
     const rw = rewriteThis(src)
     if (rw == null) {
       return { code: null, errors: [`${label} 的 this 改写失败（引号上下文异常）`] }
@@ -601,13 +602,12 @@ export function generateBuildVars(
   // guarded codegen——取值函数只对 __d 内下标求值，干净槽位返回占位 0
   // （区间扫描不读）；无 __d 即全量求值。
   const guarded = exprs.map((e, i) => `__d&&!__d.has(${i})?0:${e}`)
-  const code = `function(__comp, __d) { return [${guarded.join(', ')}] }`
+  const code = `function(__comp, __d) { ${preludeOut}\nreturn [${guarded.join(', ')}] }`
   if (alwaysDirty.length) biMap[''] = alwaysDirty
   const hasBi = Object.keys(biMap).length > 0
   return {
     code,
     errors: [],
-    superHelpers: superHelpers.size ? [...superHelpers] : [],
     viewDepVarIndices: hasBi ? biMap : undefined,
   }
 }
@@ -625,7 +625,6 @@ export function generateSubBuildVars(
 ): BuildVarsResult {
   const label = `子模板 sub#${cand.subId}`
   const paramsCode = cand.params.length ? `, ${cand.params.join(', ')}` : ''
-  const superHelpers = new Set<string>()
   const extras = opts?.extras
 
   // ---- raw free-check（wraps 前，带指令模板回调跳过）----
@@ -640,7 +639,7 @@ export function generateSubBuildVars(
     return { code: null, errors: freeErr, freeIds: collectRejectedFree(free, comp) }
   }
 
-  // ---- prelude：wraps → stripTs → TS 复检 → super 改写 ----
+  // ---- prelude：wraps → stripTs → TS 复检 ----
   let preludeOut = ''
   if (rawPrelude) {
     preludeOut = applySubIdWraps(cand.preludeStart, cand.preludeEnd, source, allCandidates, extras, opts?.carriers)
@@ -648,17 +647,18 @@ export function generateSubBuildVars(
     if (TS_SYNTAX_RE.test(preludeOut)) {
       return { code: null, errors: [`${label} prelude 含 TS 专有语法，放弃注入`] }
     }
-    preludeOut = rewriteSuper(preludeOut, superHelpers)
   }
 
-  // ---- exprs ----
-  // 展示用根名分类：子模板取值函数恒全量求值，此映射仅供依赖清单的更新映射展示
-  // —— 默认跳过（省每插值一次字符串 parse + 链分类），仅 depsDisplay（verbose）时计算
-  const depsDisplay = opts?.depsDisplay === true
-  const biMap: Record<string, number[]> = {}
-  const alwaysDirty: number[] = []
-  const exprsOut: string[] = []
-  for (const v of cand.vars) {
+// ---- exprs ----
+// 展示用根名分类：子模板取值函数恒全量求值，此映射仅供依赖清单的更新映射展示
+// —— 默认跳过（省每插值一次字符串 parse + 链分类），仅 depsDisplay（verbose）时计算
+const depsDisplay = opts?.depsDisplay === true
+const biMap: Record<string, number[]> = {}
+const alwaysDirty: number[] = []
+const exprsOut: string[] = []
+for (const v of cand.vars) {
+    // `${CONST}` 静态片段：不参与取值（与主模板 generateBuildVars 的跳过规则一致）
+    if (v.fragment) continue
     let src =
       typeof v.start === 'number' && typeof v.end === 'number'
         ? applySubIdWraps(v.start, v.end, source, allCandidates, extras, opts?.carriers)
@@ -669,7 +669,6 @@ export function generateSubBuildVars(
     if (TS_SYNTAX_RE.test(src)) {
       return { code: null, errors: [`${label} 插值 #${v.index} 含 TS 专有语法，放弃注入`] }
     }
-    src = rewriteSuper(src, superHelpers)
     const rw = rewriteThis(src)
     if (rw == null) {
       return { code: null, errors: [`${label} 插值 #${v.index} 的 this 改写失败`] }
@@ -694,7 +693,6 @@ export function generateSubBuildVars(
   return {
     code,
     errors: [],
-    superHelpers: superHelpers.size ? [...superHelpers] : [],
     viewDepVarIndices: depsDisplay && Object.keys(biMap).length ? biMap : undefined,
   }
 }

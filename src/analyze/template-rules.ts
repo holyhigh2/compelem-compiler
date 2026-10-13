@@ -14,10 +14,12 @@
  * 错误定位统一挂在模板字面量整体（start/end = 模板源码区间），明细在 message 中。
  */
 import type { ComponentAnalysis } from '../types'
-import { keyName } from '../utils/oxc'
+import { keyName, superClassName } from '../utils/oxc'
 import type { TemplateTree, TElement, TNode } from './template-tree'
 import type { MainTemplate, TemplateVarInfo } from './template-extract'
 import type { ConventionsContext } from './conventions'
+import { bodyReturnsTemplate, unwrapTsExpr } from './conventions'
+import { collectTemplateTagAliases } from './template'
 
 export interface TemplateRuleError {
   start: number
@@ -50,14 +52,6 @@ const KNOWN_BASE_MEMBERS = new Set([
   'shadowRoot', 'slots', 'slotHooks', 'cssSheets', 'globalCssSheet', 'attrs', 'props',
   'isMounted', 'isDestroyed', 'cssVars', 'tagName',
 ])
-
-function superClassName(node: any): string | null {
-  const sc = node.superClass
-  if (!sc) return null
-  if (sc.type === 'Identifier') return sc.name
-  if (sc.type === 'MemberExpression' && sc.property?.type === 'Identifier') return sc.property.name
-  return null
-}
 
 function collectElements(nodes: TNode[], out: TElement[]): void {
   for (const nd of nodes) {
@@ -145,58 +139,76 @@ export function checkTemplateRules(
 
   const members = collectMemberNames(comp, ctx)
 
-  // ---- C1: 指令插入位置校验 ----
-  // 遍历主模板 vars，对 isDirectiveCall 的插值检查其在树中的位置是否被该指令允许
-  const directiveVars = tmpl.vars.filter((v) => v.isDirectiveCall && v.directiveName)
-  if (directiveVars.length) {
-    // 建立 varIndex → 所在位置 的映射（tag=标签属性位 / text=文本插值 / slot=组件标签体内插值）
-    const varPosMap = new Map<number, 'tag' | 'text' | 'slot'>()
-    // 标签属性位
-    for (const el of elements) {
-      for (const a of el.attrs) {
-        if (a.name.includes('⟬')) {
-          // 属性名整体插值 = TAG 指令位
-          const m = /⟬Ċ⟭(\d+)/.exec(a.name)
-          if (m) varPosMap.set(+m[1], 'tag')
-        }
-        for (const p of a.parts) {
-          if (p.type === 'var') {
-            // 属性值内的指令调用：按 TAG 处理（模板中指令出现在属性值里的情况极少，但 bind/show 等确实可能）
-            // 实际上指令只允许出现在标签位或文本位；属性值内的指令调用由 codegen 层报错，这里不重复
-          }
-        }
+  // 位置映射：varIndex → 所在位置（tag=标签属性位 / text=文本插值 / slot=组件标签体内插值）
+  // C1（指令位置）与 C2（文本位插 Template）共用，无条件构建。
+  const varPosMap = new Map<number, 'tag' | 'text' | 'slot'>()
+  for (const el of elements) {
+    for (const a of el.attrs) {
+      if (a.name.includes('⟬')) {
+        // 属性名整体插值 = TAG 指令位
+        const m = /⟬Ċ⟭(\d+)/.exec(a.name)
+        if (m) varPosMap.set(+m[1], 'tag')
       }
     }
-    // 文本/插值位（含 slot 体内）
-    const walkText = (nodes: TNode[], inSlot: boolean) => {
-      for (const nd of nodes) {
-        if (nd.type === 'text') {
-          for (const p of nd.parts) {
-            if (p.type === 'var' && !varPosMap.has(p.index)) {
-              varPosMap.set(p.index, inSlot ? 'slot' : 'text')
-            }
+  }
+  const walkText = (nodes: TNode[], inSlot: boolean) => {
+    for (const nd of nodes) {
+      if (nd.type === 'text') {
+        for (const p of nd.parts) {
+          if (p.type === 'var' && !varPosMap.has(p.index)) {
+            varPosMap.set(p.index, inSlot ? 'slot' : 'text')
           }
-        } else if (nd.type === 'element') {
-          const isComp =
-            (knownTags?.has(nd.tag.toLowerCase()) ?? false) ||
-            nd.tag === 'SLOT' ||
-            nd.tag === 'slot'
-          walkText(nd.children, isComp)
         }
+      } else if (nd.type === 'element') {
+        // HTML 标签名大小写不敏感，`<Slot>` 与 `<slot>` 同义。这里必须比小写形式 ——
+        // 只认 'slot' / 'SLOT' 会把 `<Slot>` 判成普通元素，其体内插值落到 'text' 位，
+        // 于是 `slot()` 指令在该位置合法、却被误报 E-DIRECTIVE-SCOPE。
+        const isComp = (knownTags?.has(nd.tag.toLowerCase()) ?? false) || nd.tag.toLowerCase() === 'slot'
+        walkText(nd.children, isComp)
       }
     }
-    walkText(tree.root, false)
+  }
+  walkText(tree.root, false)
 
-    for (const v of directiveVars) {
-      const allowed = DIRECTIVE_SCOPES[v.directiveName!]
-      if (!allowed) continue // 未知指令名（自定义指令）→ 放行
-      const pos2 = varPosMap.get(v.index)
-      if (pos2 && !allowed.includes(pos2)) {
+  // ---- C1: 指令插入位置校验 ----
+  const directiveVars = tmpl.vars.filter((v) => v.isDirectiveCall && v.directiveName)
+  for (const v of directiveVars) {
+    const allowed = DIRECTIVE_SCOPES[v.directiveName!]
+    if (!allowed) continue // 未知指令名（自定义指令）→ 放行
+    const pos2 = varPosMap.get(v.index)
+    if (pos2 && !allowed.includes(pos2)) {
+      errs.push({
+        ...pos,
+        message:
+          `E-DIRECTIVE-SCOPE: 指令 '${v.directiveName}' 只能出现在 ${allowed.join('/')} 位置，` +
+          `当前在 ${pos2} 位置`,
+      })
+    }
+  }
+
+  // ---- C2: 文本/插槽位插值「返回 Template（子视图）的表达式」⇒ 禁止 ----
+  // 子视图必须经指令（forEach/if/when）或子组件（自定义元素）实现；直接把返回 Template
+  // 的本地函数插值到文本位会被字符串化成 [object Object]（见 IntroPage 旧写法）。
+  // 仅针对「本文件模块级函数」——跨文件导入无法静态证明返回类型，宁漏勿误报。
+  const hAliases = collectTemplateTagAliases(comp)
+  const localTemplateFns = new Set<string>()
+  for (const [name, fn] of ctx.moduleFunctions ?? []) {
+    if (fn.annotatedTemplate || bodyReturnsTemplate(fn.node, hAliases)) localTemplateFns.add(name)
+  }
+  for (const v of tmpl.vars) {
+    if (v.isDirectiveCall) continue
+    const p2 = varPosMap.get(v.index)
+    if (p2 !== 'text' && p2 !== 'slot') continue
+    const expr = unwrapTsExpr(v.node)
+    if (expr?.type === 'CallExpression' && expr.callee?.type === 'Identifier') {
+      if (localTemplateFns.has(expr.callee.name)) {
         errs.push({
-          ...pos,
+          start: v.start ?? pos.start,
+          end: v.end ?? pos.end,
           message:
-            `E-DIRECTIVE-SCOPE: 指令 '${v.directiveName}' 只能出现在 ${allowed.join('/')} 位置，` +
-            `当前在 ${pos2} 位置`,
+            `E-TEMPLATE-INTERP: 插值表达式 '${v.exprSource}' 返回 Template（子视图），` +
+            `不能直接插值在文本位（会被字符串化为 [object Object]）。` +
+            `请改用 forEach / if / when 指令，或将结构抽成子组件（自定义元素）。`,
         })
       }
     }

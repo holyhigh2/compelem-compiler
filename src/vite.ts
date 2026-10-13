@@ -58,21 +58,15 @@ export interface VitePluginOptions extends CompilerOptions {
   /** 是否输出每个文件的编译诊断 */
   verbose?: boolean
   /**
-   * D7（模板内直接嵌套模板）命中的处理力度。
-   * - `'warn'`（默认）：仅控制台提示 D7 消息
-   * - `'error'`：直接阻断构建，用于 CI 强制把关
-   * - `'silent'`：不提示
-   */
-  d7?: 'warn' | 'error' | 'silent'
-  /**
    * 约定错误（E-*：emit 未声明/非字面量、@prop 缺 type/命名/赋值、@computed 非 getter、
    * @csscope 非 static getter）的处理力度。默认 `'error'` —— 约定违规直接阻断构建。
    */
   conventions?: 'error' | 'warn' | 'silent'
 
-  // compelem 不允许降级。基于 signal 模型的架构**必须**依赖编译器编译后执行，
-  // 静态分析推不出正确依赖（D 系列）时唯一的正确做法是**报错**，而不是产出
-  // 「运行时静默不渲染 / 渲染错」的降级产物。规则不对 ⇒ 编译报错，没有可调力度。
+  // 静态分析闸门（D 系列）**不提供力度选项**：基于 signal 模型的架构必须经编译器
+  // 编译后执行，推不出正确依赖时唯一正确的做法是报错，而不是产出「运行时静默不渲染 /
+  // 渲染错」的凑合产物。故 D 系列命中由 compileFile 直接抛 StaticAnalysisError，
+  // 在这里冒泡成构建错误，无 warn/silent 档位可言。
 
   /**
    * 调试用：把编译产物写到源文件同级（`foo.ts` → `foo.js`），便于直接查看
@@ -120,21 +114,24 @@ function offsetToLineCol(code: string, offset: number, nl?: Int32Array): string 
 }
 
 /** 收集全部诊断违规（D7 或约定错误），带上 id / 行列信息。 */
+/**
+ * 从 diagnostics 收集**约定错误**（E-*）为可上报文本。
+ *
+ * ⚠️ 只有约定错误。静态分析未通过的组件由 `compileFile` **抛** `StaticAnalysisError`，
+ * 在这里就冒泡成构建错误了 —— 不会出现在 `res.diagnostics` 里。故本函数无需
+ * （也无法）处理 D 系列。
+ */
 function collectErrors(
   res: ReturnType<typeof compileFile>,
   code: string,
   id: string,
   root: string,
-  kind: 'd7' | 'conventions',
 ): string[] {
   const out: string[] = []
   const rel = id.startsWith(root) ? id.replace(/\\/g, '/').slice(root.replace(/\\/g, '/').length + 1) : id
   let nl: Int32Array | undefined
   for (const d of res.diagnostics) {
-    const list =
-      kind === 'd7'
-        ? d.errors.map((e) => ({ offset: e.exprStart, message: e.message }))
-        : (d as any).conventionErrors?.map((e: any) => ({ offset: e.start, message: e.message })) ?? []
+    const list = d.conventionErrors?.map((e) => ({ offset: e.start, message: e.message })) ?? []
     for (const e of list) {
       nl ??= newlineIndex(code)
       const at = offsetToLineCol(code, e.offset, nl)
@@ -160,7 +157,6 @@ function reportErrors(msgs: string[], mode: 'warn' | 'error' | 'silent', head: s
 /** compelem 编译期优化插件。 */
 export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin {
   let root = process.cwd()
-  const d7Mode = options.d7 ?? 'warn'
   const convMode = options.conventions ?? 'error'
   const knownTags = new Set<string>()
   if (options.knownTags) for (const t of options.knownTags) knownTags.add(t.toLowerCase())
@@ -214,36 +210,10 @@ export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin
         transformCache.set(cacheKey, res)
       }
 
-      // D7 是独立于「是否注入」的写法约束，没发生源码改动也要检查
-      if (d7Mode !== 'silent') {
-        const msgs = collectErrors(res, code, id, root, 'd7')
-        reportErrors(msgs, d7Mode, `[compelem/compiler] 检测到 ${msgs.length} 处禁止写法：`, this)
-      }
-
-      // 约定错误：独立于降级判定，默认直接阻断构建
+      // 约定错误：独立于静态分析闸门，默认直接阻断构建
       if (convMode !== 'silent') {
-        const msgs = collectErrors(res, code, id, root, 'conventions')
+        const msgs = collectErrors(res, code, id, root)
         reportErrors(msgs, convMode, `[compelem/compiler] 检测到 ${msgs.length} 处约定错误：`, this)
-      }
-
-      // D 系列命中 = 静态分析无法保证正确性 ⇒ **一律编译报错，无降级路径**。
-      // compelem 的架构前提就是「必须经编译器编译后执行」，所以这里没有
-      // warn/silent 档位：规则不对就不是能跑的代码，必须让用户在构建期看到。
-      const degraded = res.diagnostics.filter((d) => d.degraded)
-      if (degraded.length) {
-        const root2 = root.replace(/\\/g, '/')
-        const msgs = degraded.map((d) => {
-          const rel = id.startsWith(root)
-            ? id.replace(/\\/g, '/').slice(root2.length + 1)
-            : id
-          return `${rel} [${d.className}] 静态分析未通过：${d.reason ?? '未知原因'}`
-        })
-        reportErrors(
-          msgs,
-          'error',
-          `[compelem/compiler] 检测到 ${msgs.length} 个未通过静态分析的组件（compelem 不支持降级，必须修）：`,
-          this,
-        )
       }
 
       if (!res.changed) return null
@@ -254,8 +224,7 @@ export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin
       if (options.verbose) {
         const rel = id.startsWith(root) ? id.slice(root.length + 1) : id
         for (const d of res.diagnostics) {
-          const state = d.degraded ? `降级(${d.reason})` : `编译(${d.viewDeps} deps)`
-          console.log(`[compelem/compiler] ${rel} :: ${d.className} → ${state}`)
+          console.log(`[compelem/compiler] ${rel} :: ${d.className} → 编译(${d.viewDeps} deps)`)
         }
       }
       return { code: res.code, map: options.debugSourceMap ? null : res.map }

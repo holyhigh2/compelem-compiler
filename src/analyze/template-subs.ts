@@ -7,18 +7,25 @@
  * 准入约束：
  * - 每个模板回调内恰好 1 个 h``（块体须为顶层 return 的直接参数）；
  * - 回调形参 / prelude / 插值中的自由标识符必须可在静态作用域解析；
- * - 任一回调提取失败 → SubExtractError → 整组件降级（编译插件默认报错阻断）。
+ * - 模板位必须是 render() 内**字面量书写的**箭头函数/函数表达式（when 的 cases
+ *   必须是对象/数组字面量且分支值均为字面量函数）。变量引用、展开、条件表达式
+ *   都无法枚举出分支，拿不到 __subId；
+ * - 任一回调提取失败 → SubExtractError → 整组件报错阻断构建。
  */
 import type { ComponentAnalysis } from '../types'
 import { COMpelem_DIRECTIVES, TEMPLATE_ARG_INDEX } from './render-body'
 import {
+  TAG_ONLY_DIRECTIVES,
   TS_SYNTAX_RE,
   TemplateExtractError,
+  extractThisChainPaths,
+  staticHtmlFragmentOf,
   type MainTemplate,
   type TemplateVarInfo,
 } from './template-extract'
 import { collectTemplateTagAliases } from './template'
-import { topLevelReturns } from '../utils/oxc'
+import { stripTs } from './strip-ts'
+import { topLevelReturns, unwrapExpr } from '../utils/oxc'
 
 export class SubExtractError extends Error {}
 
@@ -38,22 +45,7 @@ function isFnNode(n: any): boolean {
   return !!n && FN_TYPES.has(n.type)
 }
 
-function unwrapExpr(n: any): any {
-  let cur = n
-  while (
-    cur &&
-    (cur.type === 'ParenthesizedExpression' ||
-      cur.type === 'TSAsExpression' ||
-      cur.type === 'TSNonNullExpression' ||
-      cur.type === 'TSSatisfiesExpression' ||
-      cur.type === 'TSTypeAssertion')
-  ) {
-    cur = cur.expression ?? cur
-  }
-  return cur
-}
-
-/** 一个被提取的模板回调子模板。start/end 为回调函数节点的绝对偏移。 */
+/** 一个被提取的模板回调子模板。start/end 为回调函数节点的绝对偏移 */
 export interface SubCandidate {
   /** 按绝对 start 升序分配的稳定编号（0..n-1），写入 __subId */
   subId: number
@@ -83,102 +75,10 @@ export interface SubCandidate {
 }
 
 // ---------- TS 剥离（prelude / 回调体常见 `x!` 后缀非空断言） ----------
-
-/**
- * 剥离后缀非空断言 `expr!`（上下文感知，跳过字符串/模板字面量）。
- * 不处理 `as`/`satisfies`：复检 TS_SYNTAX_RE 仍命中则由调用方降级。
- */
-export function stripTs(src: string): string {
-  let out = ''
-  const stack: Array<{ t: string; brace?: number }> = [{ t: 'code', brace: 0 }]
-  let i = 0
-  const n = src.length
-  const isWord = (ch: string) => !!ch && /[A-Za-z0-9_$]/.test(ch)
-  while (i < n) {
-    const top = stack[stack.length - 1]
-    const c = src[i]
-    if (top.t === 'sq' || top.t === 'dq' || top.t === "'" || top.t === '"') {
-      if (c === '\\') {
-        out += src.slice(i, i + 2)
-        i += 2
-        continue
-      }
-      if (top.t === c) stack.pop()
-      out += c
-      i++
-      continue
-    }
-    if (top.t === 'tpl' || top.t === '`') {
-      if (c === '\\') {
-        out += src.slice(i, i + 2)
-        i += 2
-        continue
-      }
-      if (c === '`') {
-        stack.pop()
-        out += c
-        i++
-        continue
-      }
-      if (c === '$' && src[i + 1] === '{') {
-        stack.push({ t: 'code', brace: 0 })
-        out += '${'
-        i += 2
-        continue
-      }
-      out += c
-      i++
-      continue
-    }
-    // code
-    if (c === "'" || c === '"' || c === '`') {
-      stack.push({ t: c })
-      out += c
-      i++
-      continue
-    }
-    if (c === '{') {
-      top.brace = (top.brace ?? 0) + 1
-      out += c
-      i++
-      continue
-    }
-    if (c === '}') {
-      if ((top.brace ?? 0) === 0 && stack.length > 1) {
-        stack.pop()
-        out += c
-        i++
-        continue
-      }
-      top.brace = (top.brace ?? 0) - 1
-      out += c
-      i++
-      continue
-    }
-    if (c === '!') {
-      const prev = out.length ? out[out.length - 1] : ''
-      const next = i + 1 < n ? src[i + 1] : ''
-      // 后缀非空断言：前驱为词/)/]/引号/反引号，且不是 != / !==
-      const postfix =
-        next !== '=' &&
-        next !== '' &&
-        (isWord(prev) || prev === ')' || prev === ']' || prev === "'" || prev === '"' || prev === '`')
-      // 行尾/结构符前的 `x!`（next 为 ; , } ) 换行或已到末尾前的空白序列）
-      const eol =
-        next === '' ||
-        /[;,\n\r)}]/.test(next) ||
-        (next === ' ' && /^\s*[;,\n\r)}]/.test(src.slice(i + 1)))
-      if ((postfix && (eol || next === '.' || next === '[' || next === '(')) || (isWord(prev) && eol)) {
-        i++
-        continue
-      }
-    }
-    out += c
-    i++
-  }
-  if (stack.length !== 1) return src
-  return out
-}
+// 实现已移到零依赖模块 ./strip-ts：`template-extract` 也要用它（分析期须
+// stripTs → TS 复检，与 codegen 同序），而本文件已 import 了 template-extract，
+// 反向 import 会形成模块环。这里保留同名再导出，现有调用方无需改动。
+export { stripTs }
 
 /**
  * 在绝对区间 [absStart, absEnd) 内为候选回调插入 Object.assign(..., {__subId: N}) 包装。
@@ -346,6 +246,8 @@ function isDirectiveCall(node: any, comp: ComponentAnalysis): string | null {
   if (node.type !== 'CallExpression' || node.callee?.type !== 'Identifier') return null
   const imported = comp.compelemImports.get(node.callee.name)
   if (imported && COMpelem_DIRECTIVES.has(imported)) return imported
+  // 外部指令（options.knownDirectives，如 outlet）：同指令点语义
+  if (comp.knownDirectives?.has(node.callee.name)) return node.callee.name
   return null
 }
 
@@ -371,7 +273,18 @@ function collectFromArgs(ctx: CollectCtx, directive: string, args: any[]): void 
       collectWhenCases(ctx, arg)
       return
     }
-    // 非模板实参 / 非字面量模板位（Identifier 引用、内层 CallExpression 等）
+    // 模板位但不是字面量箭头（Identifier 引用 / 调用结果 / 条件表达式等）：
+    // 无法静态定位回调，也就无法分配 __subId。**构建期阻断** —— 旧实现静默放过，
+    // 产物里该回调没有 __subId，运行时 resolveSubTemplateMeta 返回 undefined，
+    // 分支悄悄渲染成空白。此处不报，等到运行期只会看到无源的空白区域。
+    if (isTemplate) {
+      throw new SubExtractError(
+        `@${directive} 的第 ${i + 1} 个模板实参不是字面量函数（实参类型 ${arg.type}）。` +
+          `结构指令的模板回调必须是 render() 内直接书写的箭头函数/函数表达式：` +
+          `变量引用、调用结果、条件表达式等都无法静态提取子模板。`,
+      )
+    }
+    // 非模板实参：继续下钻找嵌套指令
     walkCollect(ctx, arg)
   })
 }
@@ -381,16 +294,20 @@ function collectWhenCases(ctx: CollectCtx, cases: any): void {
   if (cases.type === 'ObjectExpression') {
     for (const prop of cases.properties ?? []) {
       if (prop.type === 'SpreadElement') {
-        walkCollect(ctx, prop.argument)
-        continue
+        throw new SubExtractError(
+          `when 的 cases 含展开运算符（…${prop.argument?.type ?? '未知'}）。` +
+            `展开进来的分支编译器看不到，无法分配 __subId；请把各分支改为显式键值对。`,
+        )
       }
       const val = prop.value
-      if (isFnNode(val)) {
-        if (!ctx.candidates.includes(val)) ctx.candidates.push(val)
-        walkCollect(ctx, val)
-      } else {
-        walkCollect(ctx, val)
+      if (!isFnNode(val)) {
+        throw new SubExtractError(
+          `when 的 cases 键「${prop.key?.name ?? prop.key?.value ?? '?'}」的值不是字面量函数（${val?.type ?? '未知'}）。` +
+            `每个分支必须是 render() 内直接书写的箭头函数/函数表达式。`,
+        )
       }
+      if (!ctx.candidates.includes(val)) ctx.candidates.push(val)
+      walkCollect(ctx, val)
     }
     return
   }
@@ -407,19 +324,29 @@ function collectWhenCases(ctx: CollectCtx, cases: any): void {
         const els = el.elements ?? []
         if (els[0]) walkCollect(ctx, els[0])
         const tmpl = els[1]
-        if (isFnNode(tmpl)) {
-          if (!ctx.candidates.includes(tmpl)) ctx.candidates.push(tmpl)
-          walkCollect(ctx, tmpl)
-        } else if (tmpl) {
-          walkCollect(ctx, tmpl)
+        if (!tmpl) continue
+        if (!isFnNode(tmpl)) {
+          throw new SubExtractError(
+            `when 的 [条件, 模板] 数对里模板位不是字面量函数（${tmpl.type}）。` +
+              `模板回调必须是 render() 内直接书写的箭头函数/函数表达式。`,
+          )
         }
+        if (!ctx.candidates.includes(tmpl)) ctx.candidates.push(tmpl)
+        walkCollect(ctx, tmpl)
         continue
       }
-      walkCollect(ctx, el)
+      throw new SubExtractError(
+        `when 的 cases 数组元素既不是函数也不是 [条件, 模板] 数对（${el.type}）。`,
+      )
     }
     return
   }
-  // 非字面量（Identifier 等）→ 运行时 fallback，无候选
+  // 非字面量（Identifier / 条件表达式 / 调用结果等）→ 无法枚举分支，构建期阻断
+  throw new SubExtractError(
+    `when 的 cases 不是字面量（${cases.type}）。` +
+      `编译器必须看到完整的分支列表才能逐个分配 __subId；` +
+      `变量引用、条件表达式、调用结果都无法静态提取，请改为内联对象/数组字面量。`,
+  )
 }
 
 function walkCollect(ctx: CollectCtx, node: any): void {
@@ -525,14 +452,29 @@ function buildCandidate(ctx: CollectCtx, fn: any): SubCandidate {
   const exprs: any[] = quasi.expressions ?? []
   const vars: TemplateVarInfo[] = exprs.map((e: any, index: number) => {
     const exprSource = __source.slice(e.start, e.end).trim()
+    // `${html(CONST)}` 静态 HTML 常量：与主模板同一套判据（staticHtmlFragmentOf）。
+    // 子模板的取值同样走 generateSubBuildVars，跳过规则一致 ⇒ 参数/取值下标对齐。
+    const fragment = staticHtmlFragmentOf(e, ctx.comp)
     let isDirectiveCallFlag = false
     let directiveName: string | undefined
     let moduleBindingName: string | undefined
+    // TAG 位指令（bind/show/model/classes/styles/html）需要 this 链供运行期回退：
+    // 如 `model(this.foo,'select')` → directiveVarChain ['foo']，`model` 指令靠它算出
+    // 回写路径（缺少时 path=undefined ⇒ 值写到 ctx['undefined']，双向绑定上行静默失效）。
+    // 子模板必须与主模板（template-extract 同名逻辑）保持一致。
+    let directiveVarChain: string[] | undefined
     if (e.type === 'CallExpression' && e.callee?.type === 'Identifier') {
       const imported = ctx.comp.compelemImports.get(e.callee.name)
       if (imported && COMpelem_DIRECTIVES.has(imported)) {
         isDirectiveCallFlag = true
         directiveName = imported
+        if (TAG_ONLY_DIRECTIVES.has(imported)) {
+          directiveVarChain = extractThisChainPaths(e.arguments ?? [])
+        }
+      } else if (ctx.comp.knownDirectives?.has(e.callee.name)) {
+        // 外部指令（options.knownDirectives，如 outlet）：同指令点语义
+        isDirectiveCallFlag = true
+        directiveName = e.callee.name
       } else if (ctx.comp.moduleBindings?.has(e.callee.name)) {
         // 同 template-extract：模块绑定只记名，指令判定交由标签位 codegen 放行
         moduleBindingName = e.callee.name
@@ -543,7 +485,9 @@ function buildCandidate(ctx: CollectCtx, fn: any): SubCandidate {
       exprSource,
       isDirectiveCall: isDirectiveCallFlag,
       directiveName,
+      directiveVarChain,
       moduleBindingName,
+      fragment,
       start: e.start,
       end: e.end,
     }

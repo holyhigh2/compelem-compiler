@@ -1,80 +1,90 @@
 /**
  * @compelem/compiler — 类型定义
- *
- * 与 compelem 侧 `CompiledStatic`（src/types.ts）保持结构一致。
- * 双份定义的取舍：compiler 不应强依赖 compelem 的类型包（peer 可选），
- * 因此本地镜像一份，并在 `test/` 里做一致性断言防止漂移。
  */
 
 /**
- * 每个类的 `props`/`states`/`computedGetters` 都是**沿构造器原型链浅替换合并后的
- * 完整表**（子类字面量叠加 `Reflect.getPrototypeOf(this).__ce_static__`）。
+ * debug 分块产物的整行注释前缀：`//////// …… <标签>`（纯注释、不改行为）。产物默认按块生成，无开关。
  */
-
-/** debug 分块产物的整行注释前缀：`//////// …… <标签>`（纯注释、不改行为）。产物默认按块生成，无开关。 */
 export const DEBUG_DIV = '////////////////////////////////////'
 
+/** 一次建树的返回结构：主 buildTemplate 与 subViews 元素同形。 */
+export interface BuiltTemplateResult {
+  fragment: any
+  ups: any[]
+  emptyEvents?: Record<number, string[]>
+  /** 文档序元素+文本节点（与 nodeSn 对齐；运行时免 collectNodes 回扫） */
+  nodes?: any[]
+  updateSns?: number[]
+  /** 从 fragment 根取节点的 childNodes 下标链（运行时 O(1) 定位，免 collectNodes） */
+  updatePaths?: number[][]
+}
+
+/** 一个结构指令回调的子视图产物（`subViews[subId]`）。 */
+export interface CompiledSubView {
+  buildTemplate?: (this: any) => BuiltTemplateResult
+  pointEffects?: any[]
+  fx?: any[]
+}
+
 /**
- * 编译器注入到组件类上的静态成员。
- * 强制编译插件模式：`buildTemplate` 准入静态视图路径（缺失 = 无视图，无运行时回退）；
- * 其余字段可选。取值表达式一律内联进 fx/pointEffects 工厂，产物不携带取值函数或
- * 静态依赖元数据；依赖在 effect 运行期动态建立（DepSummary 仅在 compile.ts 内部
- * 计算，供 verbose 展示）。
+ * 编译器注入到组件类上的静态成员
  */
 export interface CompiledStatic {
-  version: number
   /**
-   * `buildTemplate` 静态实现：纯 `document` API 建 DOM 函数
-   * （以首个组件实例为 `this` 调用；与 compelem 侧 `CompiledStatic.buildTemplate` 同形）。
+   * 静态视图产物。与 `noView` 构成**互斥二选一**，两者皆无会被运行时判为
+   * 「未编译」并抛错（`CompElem.ts` setup 的第三分支）。
+   *
+   * ⚠️ 所以**缺席不代表无视图**：缺席是错误态，专留给「插件没跑 / 该有视图却没编出来」。
+   * 无视图组件必须由编译器显式写 `noView: true`。
    */
-  buildTemplate?: (this: any) => {
-    fragment: any
-    ups: any[]
-    emptyEvents?: Record<number, string[]>
-    /** 文档序元素+文本节点（与 nodeSn 对齐；运行时免 collectNodes 回扫） */
-    nodes?: any[]
-    updateSns?: number[]
-    updatePaths?: number[][]
-  }
-  /** `@watch` 编译期解析产物（`analyze/watch-extract.ts` 序列化，装饰器被删时必须注入） */
-  watchers?: CompiledWatcher[]
+  buildTemplate?: (this: any) => BuiltTemplateResult
   /**
    * 结构指令模板回调的子视图 codegen：`__subId` → 独立 buildTemplate + fx/pointEffects。
-   * 运行时结构指令经 `fn.__subId` 查表消费；缺失按构建期报错处理。
+   * 运行时结构指令经 provenance / `fn.__subId` 查表消费；缺失按构建期报错处理。
    */
-  subViews?: Record<
-    number,
-    {
-      buildTemplate?: (this: any) => {
-        fragment: any
-        ups: any[]
-        emptyEvents?: Record<number, string[]>
-        nodes?: any[]
-        updateSns?: number[]
-        updatePaths?: number[][]
-      }
-    }
-  >
+  subViews?: Record<number, CompiledSubView>
+  /** prop 定义表（沿构造器原型链浅替换合并后的**完整**表） */
+  props?: Record<string, any>
+  /** state 定义表（同上，合并语义） */
+  states?: Record<string, any>
+  /** `@computed` getter 函数外提（装饰器与成员被剥离）；仅 devtools 元数据消费 */
+  computedGetters?: Record<string, () => any>
+  /** `@watch` 产物：每个 watch 一个 effect 工厂，setup 期逐条 `effect(factory(this))` */
+  watchEffects?: Array<(comp: any) => () => void>
+  /** `cssVars` 的响应式 effect 工厂：工厂体内直接读 `rc.__s.<k>.value` 建依赖 */
+  cssEffect?: (comp: any) => () => void
+  /**
+   * 值点（属性/文本/指令）per-point effect 工厂表。
+   * 数值条目 = `fx` 下标（同一工厂源码在产物里只 emit 一份），其余为工厂本体。
+   */
+  pointEffects?: Array<number | ((rc: any, nodes: any[], ...params: any[]) => () => void)>
+  /** 逐实例产物工厂表（指令实例 / 事件 handler / ref 等）；下标 = `up.ux` */
+  fx?: any[]
   /**
    * 无视图组件标记：render() 不存在 / 返回 null / 继承链终点为 CompElem（其
    * `render()` 返回 null）。注入后运行时不创建 Shadow DOM，仅支持 HOST/GLOBAL 样式。
+   *
+   * ⚠️ 与 `buildTemplate` 互斥，且**必须有** —— 缺席不等于无视图（见上）。
+   * 唯一豁免：继承链经 spread 从父类继承而来（`skipInjection`），以及
+   * `CompElem` 自身声明的本字段（运行时基类兜底，非编译器产物）。
    */
   noView?: boolean
-  /*
-   * `diag` 不在产物契约里：降级信息只经 `compileResult.diagnostics` 出口。
-   * 未通过静态分析的组件直接抛 `StaticAnalysisError`，不存在带 `degraded: true`
-   * 的产物。
-   */
 }
 
-/** `@watch` 编译期解析条目（与 compelem `CompiledWatcher` 同形） */
-export interface CompiledWatcher {
+/**
+ * `@watch` 的**分析期**条目（`analyze/watch-extract.ts` 产出）。
+ *
+ * 注意：它**不是**产物的一部分 —— 编译进产物的是 `watchEffects` 工厂数组，
+ * 编译完成后本条目即丢弃。保留本类型是因为 generateBuildVars 要读 `extras`。
+ */
+export interface WatchEntry {
   name: string
   sources: string[]
   deep?: boolean
   immediate?: boolean
   once?: boolean
-  static?: boolean
+  /** 宿主成员是否为 static（决定 effect 里取 `rc.constructor` 还是 `rc`） */
+  isStatic?: boolean
 }
 
 /** 响应式字段类别，用于判定「该成员是否会被推入依赖收集列表」。 */
@@ -117,7 +127,7 @@ export interface ComponentAnalysis {
   tagName?: string
   /** 响应式字段（含继承链上收集到的，按声明顺序） */
   fields: Map<string, ReactiveField>
-  /** 本类自身定义的实例方法名（用于 D2 降级判定） */
+  /** 本类自身定义的实例方法名（D2：自有方法值不可变，不推入依赖，无需拒绝） */
   ownMethods: Set<string>
   /** 本类自身定义的 getter 名（`@computed` 之外的普通 getter，D2 视为方法） */
   ownGetters: Set<string>
@@ -136,8 +146,8 @@ export interface ComponentAnalysis {
   queryFields?: Set<string>
   /** 本类方法 / getter / 箭头字段的函数体（name → BlockStatement 节点或表达式体），供依赖提取内联扫描 */
   bodies?: Map<string, any>
-  /** 降级原因；null 表示未降级 */
-  degradeReason: string | null
+  /** 静态分析未通过的原因（D0/D4/D5/D6）；null 表示通过。非 null 即闸门抛错 */
+  staticReason: string | null
   /** 无视图组件（render() 不存在 / 返回 null / 继承链终点为 CompElem）→ 注入 noView: true */
   noView: boolean
   /** 跳过注入（同文件继承链上有 render 的祖先，继承其 __ce_static__）→ 不生成注入语句 */
@@ -161,6 +171,17 @@ export interface ComponentAnalysis {
    * 用于 D3 判定：这些名字不是「自由标识符」。
    */
   moduleBindings: Set<string>
+  /**
+   * 模块级 `const` 的初始化器：名字 → VariableDeclarator（见 collectModuleConstInits）。
+   * 供模板静态片段折叠判定 `${CONST}` 是不是模块级 `h` 标签模板常量。
+   * 只收同文件声明 —— compileFile 是单文件纯函数，跨文件 import 不解析。
+   */
+  moduleConstInits: Map<string, any>
+  /**
+   * 外部指令名（options.knownDirectives，compile.ts 注入）。插值位置对这些
+   * 导入名的调用按指令点分类（isDirectiveCall），同 COMpelem_DIRECTIVES。
+   */
+  knownDirectives?: Set<string>
 }
 
 /** 插件选项。 */
@@ -182,8 +203,12 @@ export interface CompilerOptions {
    * （TEMPLATE-CODEGEN.md §4）。
    */
   knownTags?: Iterable<string>
-  /** 关闭指定生成步骤（用于 A/B 实测对照） */
-  disable?: {
-    buildVars?: boolean
-  }
+  /**
+   * 外部指令注册表：经 `directive()` 包装、遵守 DirectiveInstance 契约的
+   * 跨包导入函数名（如 compelem-router 的 `outlet`）。插值位置对这些名字的
+   * 调用按指令点编译（vite 插件选项原样透传，无需跨文件累积）。
+   * 不提供则模块绑定调用退回值点语义 —— 与 0.28 动态引擎「函数值即指令」
+   * 的隐式契约断裂，外部指令将渲染成函数源码文本。
+   */
+  knownDirectives?: Iterable<string>
 }

@@ -2,7 +2,7 @@
 * per-point effect codegen：UpOut 描述符 → effect 工厂函数源码。
  *
  * 主模板：每个更新点一个工厂 `(rc, nodes) => effectFn`，读 `rc.__s[root].value`。
- * 子模板：整个子模板**合并成一个**工厂 `(rc, nodes, get, dep) => effectFn`，
+ * 子模板：整个子模板**合并成一个**工厂 `(rc, nodes, __ceGet, __ceDep) => effectFn`，
  *   内部逐点守卫写 DOM（见 generateSubRenderEffect）。
  *
  * 守卫一律写作 `值 !== 旧值 || rc.__f`：`rc.__f` 是 CompElem 的强制刷新标志，
@@ -23,9 +23,44 @@
 import type { UpOut } from './template-dom'
 import { applySubIdWraps, stripTs, type SubCandidate } from '../analyze/template-subs'
 import { TS_SYNTAX_RE } from '../analyze/template-extract'
-import { rewriteSuper, rewriteThis } from './build-vars'
+import { rewriteThis } from './build-vars'
 
 const J = JSON.stringify
+
+/**
+ * ⚠️⚠️ **工厂隐式形参名必须不可能与用户标识符撞名。**
+ *
+ * 工厂体里内联的是**用户源码**（只把 `this` 重写成 `rc`，其余原样保留），因此用户
+ * 完全可以在模板插值里调用模块级函数。历史形态把第 3/4 个形参命名为 `get` / `dep`：
+ *
+ * ```ts
+ * // 用户源码
+ * import { get } from 'myfx'
+ * h`<span title="${this.labelMap.get(f) + ' - ' + get(data, [f])}"></span>`
+ *
+ * // 旧 codegen 产物（形参 get 与模块级 get 同名 ⇒ 用户那次调用被解析成形参）
+ * pe: [(rc, nodes, get, dep, ov, f) => () => { const a5 = rc.labelMap.get(f) + ' - ' + get(data, [f]); … }]
+ * ```
+ *
+ * JS 词法作用域下那个 `get(data, [f])` 绑到**形参**，而运行期在子视图路径上第 3/4
+ * 实参**恒为 `undefined`**（`render.ts` 的 `registerSubViewEffects`：
+ * `(curPe[0])(component, nodes, undefined, undefined, ov, …)`）⇒ 首次求值即
+ * `TypeError: get is not a function`。经 esbuild 做作用域改名后报错变成
+ * `get4 is not a function`，且模块里的 `import { …, get, … }` 会被判定「未被引用」
+ * 而删掉 —— 现象上完全看不出与「形参撞名」有关（2026-10-09 实测于 `Board.ts` /
+ * `BoardBar.ts`，esbuild 产物里 0 处 `get4` 声明）。
+ *
+ * 这两个形参**从未被运行期赋过真值**：`render.ts` / `buildStaticView` 的注释原话是
+ * 「每个点的取值表达式都内联在 fx 工厂里，工厂不需要额外的取值解析实参」，保留它们
+ * 只为与运行期调用点保持**位置**稳定（第 1/2/5 位才是 rc / nodes / ov）。因此改名
+ * 是纯粹的 codegen 内部行为，不触及任何运行期约定。
+ *
+ * 运行时 helper（`wText`/`execDir`/…）与 `rc` / `nodes` / `ov` 三个真正被生成的代码
+ * 读写的名字不动：它们紧邻形参表前部，用户回调形参排在后面（`paramsCode` 追加），
+ * 真要撞就是**重复形参名**（ES module 严格模式下直接 SyntaxError），早就在构建期暴露。
+ */
+const P_GET = '__ceGet'
+const P_DEP = '__ceDep'
 
 export interface RenderEffectGen {
   /** `pointEffects:` 右侧完整数组表达式（只有「会随信号变化」的点） */
@@ -33,7 +68,7 @@ export interface RenderEffectGen {
   /**
    * `fx:` 右侧完整数组表达式 —— 与 `ups` **逐项 1:1**。
    *
-   * 每个工厂签名统一为 `(rc, nodes, get) => …`，按点的种类返回不同的东西：
+   * 每个工厂签名统一为 `(rc, nodes, __ceGet) => …`，按点的种类返回不同的东西：
    * - 值点（text / attr / prop / toggle）：返回 effect 函数
    * - 指令点：返回 `DirectiveInstance`（供 renderTemplate 首屏执行）
    * - 事件 / ref / refAttr 点：返回 handler / `createRef()` 对象 / 属性值
@@ -92,15 +127,21 @@ export interface InlineCtx {
   carriers?: ReadonlyMap<number, string>
   /** varIndex → 源码绝对区间 [start, end) */
   ranges?: Map<number, [number, number]>
-  /** 收集表达式里的 `super.METHOD`（供类体注入 `__ce_s_*` 转发方法） */
-  superHelpers?: Set<string>
+  /**
+   * 主模板 prelude（render() 中 return h`` 之前的顶层语句）——已完成
+   * stripTs / TS 复检 / rewriteThis('rc') 的注入版本。
+   * 引用了 prelude 局部变量的工厂会把 prelude 注入 effect 体内（每轮重算，
+   * 与 render() 每次执行重算局部变量的语义一致；读 `rc.route` getter 即订阅信号）。
+   */
+  prelude?: string
+  /** prelude 顶层声明的局部变量名（含解构 pattern），`usesPrelude` 据此判断注入点 */
+  preludeNames?: ReadonlySet<string>
 }
 
 /**
  * 把一个 var 的原始表达式**内联**进 effect 工厂（`this` → `rc`）。
  *
- * 管线（顺序不能换）：`applySubIdWraps` → `stripTs` → TS 专有语法复检 →
- * `rewriteSuper` → `rewriteThis`。
+ * 管线（顺序不能换）：`applySubIdWraps` → `stripTs` → TS 专有语法复检 → `rewriteThis`。
  *
  * 为什么指令点也能内联：`applySubIdWraps` 是纯文本拼接，只依赖
  * `source` / `candidates` / `extras`。若因反引号拒绝内联，指令点的 `__subId` 会丢失，
@@ -122,7 +163,6 @@ export function inlineExprFor(
   if (src == null) return null
   src = stripTs(src)
   if (TS_SYNTAX_RE.test(src)) return null
-  if (ctx?.superHelpers) src = rewriteSuper(src, ctx.superHelpers)
   return rewriteThis(src, 'rc')
 }
 
@@ -141,7 +181,7 @@ export function signalExprFor(
       // （field-extract 注入的 fieldInits）+ 框架自带的 `slots`；普通实例字段、
       // `@query` 查询属性都不在其中。对它们内联出 `rc.__s.x.value` 会在
       // effect 首次执行时抛 `Cannot read properties of undefined (reading 'value')`，
-      // 且因 field-extract 视其为「保守收录」而无任何降级/诊断。
+      // 且因 field-extract 视其为「保守收录」而无任何诊断。
       // 非信号根一律退回 `get(i)`，由访问器按真实语义取值。
       if (segs.length && segs[0] && signalKeys.has(segs[0])) {
         const root = segs[0]
@@ -180,8 +220,12 @@ interface Point {
  * 需要实例参数的（`wProp`/`wCssVars`/`execDir`）由 emit 点显式传 `rc`。
  */
 const RC_INTERNAL = {
-  /** 结构指令分派（模块级，首参 rc：按节点反查 `__dirNodeMap` 上的 UpdatePoint） */
+  /** 通用指令分派：TAG 位指令 / slot() / 第三方自定义指令（模块级，首参 rc） */
   execDir: 'execDir',
+  /** forEach 专用分派：多一条 UPDATE（keyed diff） */
+  execEach: 'execEach',
+  /** 条件类专用分派：ifTrue / ifElse / when，三者 tag 空间相同 */
+  execCond: 'execCond',
   /** 写函数名（模块级） */
   wText: 'wText',
   wAttr: 'wAttr',
@@ -194,9 +238,24 @@ const RC_INTERNAL = {
   wToggleProp: 'wToggleProp',
   /** cssVars 宿主镜像：模块级，首参是宿主 rc */
   wCssVars: 'wCssVars',
-  /** directive 分派辅助：模块级，首参是宿主 rc */
-  updateDir: 'updateDir',
 } as const
+
+/**
+ * 按指令名选运行时分派入口。
+ *
+ * 结构指令的 tag 空间是互斥的：只有 forEach 需要 keyed diff（UPDATE），
+ * ifTrue / ifElse / when 只会 REFRESH / REMOVE / REPLACE / NONE。给它们发各自
+ * 瘦一层的入口，运行期就不必为一堆用不到的分支付代价。
+ *
+ * 判据是 `up.directiveName`（模板解析期就确定的真名），**不是** `directiveType`
+ * —— 后者只是锚点位置（'text' | 'slot'），与指令种类无关。
+ */
+function dirEntryOf(up: UpOut): string {
+  const kind = up.directiveName || ''
+  if (kind === 'forEach') return RC_INTERNAL.execEach
+  if (kind === 'ifTrue' || kind === 'ifElse' || kind === 'when') return RC_INTERNAL.execCond
+  return RC_INTERNAL.execDir
+}
 
 /** 本次生成实际 emit 到的模块级写入器名（并集后由 compile.ts 走 compelem import 注入） */
 export type WriterSet = Set<string>
@@ -230,16 +289,36 @@ export function generateRenderEffect(
   /** 本次 emit 到的模块级写入器名（供 compile.ts 注入 import） */
   const writers: WriterSet = new Set()
   const ictx: InlineCtx | undefined = inlineCtx
+  // 主模板 prelude 注入支持：表达式引用了 prelude 局部变量的工厂，
+  // 在 effect 体（每轮重算处）注入 prelude；表达式形态工厂（fx 的
+  // prop/directive/event 返回值）则块体化后注入。未引用的工厂零开销。
+  const fxPrelude = ictx?.prelude
+  const usesPrelude = (src: string): boolean => {
+    if (!fxPrelude) return false
+    const names = ictx?.preludeNames
+    if (!names?.size) return false
+    for (const n of names) {
+      if (new RegExp(`(?<![\\w$])${n}(?![\\w$])`).test(src)) return true
+    }
+    return false
+  }
+  /** 表达式形态工厂块体化：引用 prelude 变量时注入声明，否则原样返回。 */
+  const exprFx = (inst: string): string =>
+    usesPrelude(inst) ? `(rc) => { ${fxPrelude}\nreturn (${inst}) }` : `(rc) => (${inst})`
+  /** effect 体工厂的内层取值前缀：引用 prelude 变量时注入声明。 */
+  const bodyPrelude = (src: string): string => (usesPrelude(src) ? fxPrelude + '\n' : '')
   let n = 0
   const nodeOf = (up: UpOut) => `nodes[${up.nodeSn}]`
-  const dirKindOf = (up: UpOut) => (up.directiveName || '') === 'ifTrue' ? 'ifElse' : up.directiveName || ''
   for (const up of ups) {
     // 占位点（event/ref/refAttr）不读任何信号 → **不注册 effect**，但仍要在 fx 里
     // 占位保持 1:1（事件 handler / ref 对象 / refAttr 值由 fx 交给 renderTemplate）。
     if (up.isEvent || up.isRef || up.isRefAttr) {
       const inst = inlineExprFor(up.varIndex, varIndexToExpr, ictx)
-      fx.push(inst ? `(rc) => (${inst})` : `(rc, nodes, get) => get(${up.varIndex})`)
-      if (!inst) usedGet = true
+      if (inst) fx.push(exprFx(inst))
+      else {
+        fx.push(`(rc, nodes, ${P_GET}) => ${P_GET}(${up.varIndex})`)
+        usedGet = true
+      }
       continue
     }
     // 指令点（含 TAG 位 show/classes/styles/bind/model）：var 的值是 DirectiveInstance
@@ -249,15 +328,16 @@ export function generateRenderEffect(
     // 又一处「工厂要同时满足首屏与更新」的需求，故 pointEffects 仍是 fx 的真子集。
     if (up.isDirective) {
       const inst = inlineExprFor(up.varIndex, varIndexToExpr, ictx)
-      const val = inst ?? `get(${up.varIndex})`
+      const val = inst ?? `${P_GET}(${up.varIndex})`
       if (!inst) usedGet = true
-      writers.add(RC_INTERNAL.execDir)
+      const entry = dirEntryOf(up)
+      writers.add(entry)
       // 第 5 实参传完整 DirectiveInstance：同一元素可叠多个 TAG 指令（classes+styles+show），
       // __dirNodeMap 按 node 反查会互相覆盖，运行时据实例的 diFn 挑回正确的 UpdatePoint
-      const f = `(rc, nodes, get) => { let ov; return () => { const a = (${val}); if (a[1][0] !== ov || rc.__f) { ${RC_INTERNAL.execDir}(rc, ${J(dirKindOf(up))}, ${nodeOf(up)}, a[1][0], ov, a); ov = a[1][0] } } }`
+      const f = `(rc, nodes, ${P_GET}) => { let ov; return () => { ${bodyPrelude(val)}const a = (${val}); if (a[1][0] !== ov || rc.__f) { ${entry}(rc, ${nodeOf(up)}, a[1][0], ov, a); ov = a[1][0] } } }`
       fast.push(f)
       // fx 返回 DirectiveInstance 供 renderTemplate 首屏执行（与 pointEffects 共用工厂源码）
-      fx.push(`(rc) => (${val})`)
+      fx.push(exprFx(val))
       continue
     }
     const value = signalExprFor(up.varIndex, varIndexToExpr, signalKeys)
@@ -283,7 +363,7 @@ export function generateRenderEffect(
       n++
       continue
     }
-    const factory = `(rc, nodes, get) => { let ov; return () => { const nv = ${src}; if (${p.guard} || rc.__f) { ${p.write('nv', p.node!)}; ${p.store('nv', 'ov')} } } }`
+    const factory = `(rc, nodes, ${P_GET}) => { let ov; return () => { ${bodyPrelude(src)}const nv = ${src}; if (${p.guard} || rc.__f) { ${p.write('nv', p.node!)}; ${p.store('nv', 'ov')} } } }`
     // prop 点：fx 必须返回**值**而不是 effect 工厂。
     //
     // 原因在 renderTemplate：子组件首帧还是 wrapper（见
@@ -294,7 +374,9 @@ export function generateRenderEffect(
     // 边界那一跳，本就不是热路径，而漏掉初值的症状是「子组件停在默认值」，很难查。
     if (up.isProp) {
       fast.push(factory)
-      fx.push(`(rc, nodes, get) => (${src})`)
+      fx.push(usesPrelude(src)
+        ? `(rc, nodes, ${P_GET}) => { ${fxPrelude}\nreturn (${src}) }`
+        : `(rc, nodes, ${P_GET}) => (${src})`)
     } else {
       // 去重：值点工厂在 pointEffects 与 fx 各 emit 一份相同源码，minifier 无法
       // 去重数组字面量里的函数体。pointEffects 存 fx 下标（运行时按 typeof 解引用），
@@ -306,7 +388,7 @@ export function generateRenderEffect(
     n++
   }
   if (slow.length) {
-    const packed = `(rc, nodes, get) => { const ov = []; return () => { ${slow.join(' ')} } }`
+    const packed = `(rc, nodes, ${P_GET}) => { const ov = []; return () => { ${slow.join(' ')} } }`
     fast.push(packed)
   }
   return {
@@ -321,20 +403,19 @@ export function generateRenderEffect(
  * 子模板内联器。产出一个「varIndex → 已内联取值表达式」+ prelude 的构造器。
  *
  * 管线与 `generateSubBuildVars` **逐字同构**（顺序都不能换）：
- * `applySubIdWraps` → `stripTs` → TS 专有语法复检 → `rewriteSuper` → `rewriteThis('rc')`。
- * `this` 改写目标为 `rc`（另一条取值函数生成路径改写为 `__comp`，两者须同构）。
- *
- * 为什么 prelude 不做 `rewriteThis`：与 `generateSubBuildVars` 保持一致（那边 prelude
- * 只做 wraps/stripTs/复检/rewriteSuper）。prelude 出现 `this` 时两条路径同样不解析，
- * 属既有语义，不在此处单方面改变。
- */
+* `applySubIdWraps` → `stripTs` → TS 专有语法复检 → `rewriteThis('rc')`。
+  * `this` 改写目标为 `rc`（另一条取值函数生成路径改写为 `__comp`，两者须同构）。
+  *
+  * 为什么 prelude 不做 `rewriteThis`：与 `generateSubBuildVars` 保持一致（那边 prelude
+  * 只做 wraps/stripTs/复检）。prelude 出现 `this` 时两条路径同样不解析，
+  * 属既有语义，不在此处单方面改变。
+  */
 export function buildSubInliner(
   cand: SubCandidate,
   source: string,
   candidates: readonly SubCandidate[],
   extras: ReadonlyMap<number, string> | undefined,
   carriers: ReadonlyMap<number, string> | undefined,
-  superHelpers: Set<string>,
 ): { val: (vi: number) => string | null; prelude: string | null } {
   const byIndex = new Map<number, { start?: number; end?: number; exprSource: string }>()
   for (const v of cand.vars) byIndex.set(v.index, v as any)
@@ -348,27 +429,25 @@ export function buildSubInliner(
     if (src == null) return null
     src = stripTs(src)
     if (TS_SYNTAX_RE.test(src)) return null
-    src = rewriteSuper(src, superHelpers)
     return rewriteThis(src, 'rc')
   }
   let prelude: string | null = ''
   if (cand.preludeSrc) {
     let out = applySubIdWraps(cand.preludeStart, cand.preludeEnd, source, candidates, extras, carriers)
     out = stripTs(out)
-    prelude = TS_SYNTAX_RE.test(out) ? null : rewriteSuper(out, superHelpers)
+    prelude = TS_SYNTAX_RE.test(out) ? null : out
   }
   return { val, prelude }
 }
 
 /** 结构指令点语句（内联取值版）。与 get 版 dirStmt 语义一致，只是 value 由调用方给出。 */
 function dirStmtVal(up: UpOut, a: string, value: string, old: string, writers: WriterSet): string {
-  const kind = up.directiveName || ''
-  const dirKind = kind === 'ifTrue' ? 'ifElse' : kind
+  const entry = dirEntryOf(up)
   const node = `nodes[${up.nodeSn}]`
-  writers.add(RC_INTERNAL.execDir)
+  writers.add(entry)
   return (
     `const ${a} = ${value}; ` +
-    `if (${a}[1][0] !== ${old} || rc.__f) { ${RC_INTERNAL.execDir}(rc, ${J(dirKind)}, ${node}, ${a}[1][0], ${old}, ${a}); ${old} = ${a}[1][0] }`
+    `if (${a}[1][0] !== ${old} || rc.__f) { ${entry}(rc, ${node}, ${a}[1][0], ${old}, ${a}); ${old} = ${a}[1][0] }`
   )
 }
 
@@ -379,9 +458,10 @@ function dirStmtVal(up: UpOut, a: string, value: string, old: string, writers: W
  * - 跨层子模板（表达式引用祖先回调形参，如 `row[c]`）→ 顶层工厂无法解析，走 `__fx`
  *   闭包路径（在祖先作用域物化，见 compile.ts）。
  *
- * 工厂签名 `(rc, nodes, get, dep<params>)`：前四个是运行时统一形参，`<params>` 为回调
+ * 工厂签名 `(rc, nodes, __ceGet, __ceDep<params>)`：前四个是运行时统一形参，`<params>` 为回调
  * 原始形参（运行时按 (v,k,i) 位置传参）。
- * 自洽子模板下 `get`/`dep` 不被读，保留只为与运行时调用点保持位置稳定。
+ * 自洽子模板下 `__ceGet`/`__ceDep` 不被读，保留只为与运行时调用点保持位置稳定 ——
+ * **命名必须防撞**（详见文件顶部 `P_GET`/`P_DEP` 的长注释）。
  *
  * fx 与 ups **逐项 1:1**：指令点返回 DirectiveInstance，prop 点返回值，事件/ref 点位；
  * 值点只在 fx 占位（`undefined`），其值由合并 effect 的首次 run 写入（deferValueFill）。
@@ -391,35 +471,74 @@ export function generateSubInlinedEffect(
   inlineVal: (vi: number) => string | null,
   prelude: string,
   paramsCode: string,
+  preludeNames?: Set<string>,
 ): RenderEffectGen {
   const stmts: string[] = []
   const fx: string[] = []
   let usedGet = false
   const writers: WriterSet = new Set()
   let n = 0
-  const fxSig = `(rc, nodes, get, dep${paramsCode})`
+  const fxSig = `(rc, nodes, ${P_GET}, ${P_DEP}${paramsCode})`
   // 合并 effect 工厂额外多一个**外部传入**的旧值槽数组 ov：工厂在 effect 体**每轮**被
   // 调用（item 实参读 cell.value → 订阅 + 当前值），ov 必须跨轮持久，由运行时提供。
-  const peSig = `(rc, nodes, get, dep, ov${paramsCode})`
+  const peSig = `(rc, nodes, ${P_GET}, ${P_DEP}, ov${paramsCode})`
+  /**
+   * 表达式是否引用 `prelude` 里声明的局部变量。
+   *
+   * 子模板回调体可以带**前置语句**（`forEach(list, k, (item) => { const x = f(item); return h`…` })`），
+   * 编译期把它们原样保留为 prelude。`pointEffects` 的工厂体每轮开头注入 prelude，所以
+   * `const a0 = svgName;` 这类 `stmts` 没问题；但 **`fx` 工厂是另一份独立函数**，
+   * 历史实现**没有**注入 prelude ⇒ 表达式里的 `svgName` 在 fx 作用域里根本不存在。
+   *
+   * 症状（2026-10-09 实测于 compelem-ui-website 的 `IconPage.ts`）：
+   * ```ts
+   * ${forEach(this.filteredIcons, n => n, (name) => {
+   *   const svgName = toSvgName(name)      // ← prelude
+   *   return h`<button title="${svgName}" …>`
+   * })}
+   * ```
+   * 产物：`pe` 有 `const svgName = toSvgName(name);`，`fx` 却是
+   * `(rc, nodes, __ceGet, __ceDep, name) => (svgName)` ⇒ `renderTemplate` 的
+   * `callFx` 当场求值即 `ReferenceError: svgName is not defined`，**整页不渲染**
+   * （加载期异常，`setup()` 直接抛出）。
+   */
+  const usesPrelude = (src: string): boolean => {
+    if (!prelude || !preludeNames?.size) return false
+    for (const nm of preludeNames) {
+      if (new RegExp(`(?<![\\w$])${nm}(?![\\w$])`).test(src)) return true
+    }
+    return false
+  }
+  /**
+   * `fx` 工厂体化：表达式引用 prelude 变量时把 prelude 注入工厂体再 `return`。
+   *
+   * ⚠️ 必须写成**块体**（`{ prelude; return (expr) }`）而不是默认参数或逗号表达式 ——
+   * prelude 是多语句声明序列（`const` 必须处于块作用域），且事件点形态
+   * `() => navigator.clipboard?.writeText(svgName)` 需要靠这层块作用域让内层箭头
+   * **闭包捕获** `svgName`（否则点击时同样 ReferenceError）。
+   * 未引用 prelude 的工厂保持原样（单表达式箭头），不引入多余块作用域。
+   */
+  const fxOf = (sig: string, body: string): string =>
+    usesPrelude(body) ? `${sig} => { ${prelude}\nreturn (${body}) }` : `${sig} => (${body})`
   for (const up of ups) {
     if (up.isEvent || up.isRef || up.isRefAttr) {
       const inst = inlineVal(up.varIndex)
       if (inst == null) {
         usedGet = true
         fx.push('() => undefined')
-      } else fx.push(`${fxSig} => (${inst})`)
+      } else fx.push(fxOf(fxSig, inst))
       continue
     }
     const inlined = inlineVal(up.varIndex)
     if (inlined == null) usedGet = true
-    const value = inlined ?? `get(${up.varIndex})`
+    const value = inlined ?? `${P_GET}(${up.varIndex})`
     if (up.isDirective) {
-      fx.push(inlined == null ? '() => undefined' : `${fxSig} => (${value})`)
+      fx.push(inlined == null ? '() => undefined' : fxOf(fxSig, value))
       if (inlined != null) stmts.push(dirStmtVal(up, `a${n}`, value, `ov[${n}]`, writers))
       n++
       continue
     }
-    if (up.isProp) fx.push(inlined == null ? '() => undefined' : `${fxSig} => (${value})`)
+    if (up.isProp) fx.push(inlined == null ? '() => undefined' : fxOf(fxSig, value))
     // 值点：fx 占位；值由合并 effect 首次 run 写入
     else fx.push('() => undefined')
     if (inlined == null) {
@@ -454,49 +573,21 @@ function buildPoint(up: UpOut, value: string, old: string, writers: WriterSet): 
   const node = `nodes[${up.nodeSn}]`
   const store = (v: string, o: string) => `${o} = ${v}`
 
-  // directive：结构指令交给 _execDir 走 reconcile。
   // 模块级写入器（纯 DOM 写，emit 成自由函数调用；见 RC_INTERNAL 上方说明）
   const w = (name: string, write: (v: string, nd: string) => string) => {
     writers.add(name)
     return write
   }
-  // 第 4 参是「上一次的条件/集合」：主模板是闭包标量 `ov`，子模板必须传**该点的槽位**
-  // `ov[n]` —— 传整个数组会让 ifElse 拿到恒真的数组，分支判定全错（展开失效）。
-  if (up.isDirective) {
-    // 注意：up.directiveType 只是锚点类型（'text' | 'slot'），不是指令种类。
-    // 必须拿 directiveName 比对：早前误用 directiveType，导致所有结构指令
-    // 判不出形态 → 该点不生成 effect → 组件完全不响应式。
-    const kind = up.directiveName || ''
-    if (kind === 'forEach' || kind === 'ifTrue' || kind === 'ifElse' || kind === 'when' || up.directiveType === 'slot') {
-      const dirKind = kind === 'ifTrue' ? 'ifElse' : kind
-      return {
-        value,
-        guard: `${value} !== ${old}`,
-        node,
-        write: w(RC_INTERNAL.execDir, (v, nd) => `${RC_INTERNAL.execDir}(rc, ${J(dirKind)}, ${nd}, ${v}, ${old})`),
-        store,
-      }
-    }
-    if (kind === 'show') {
-      return { value, guard: `!!${value} !== ${old}`, node, write: w(RC_INTERNAL.wShow, (v, nd) => `${RC_INTERNAL.wShow}(${nd}, ${v})`), store }
-    }
-    if (kind === 'bind' || kind === 'model') {
-      return {
-        value,
-        guard: `${value} !== ${old}`,
-        node,
-        write: w(RC_INTERNAL.wProp, (v, nd) => `${RC_INTERNAL.wProp}(rc, ${nd}, 'value', ${v})`),
-        store,
-      }
-    }
-    if (kind === 'classes') {
-      return { value, guard: `${value} !== ${old}`, node, write: w(RC_INTERNAL.wClass, (v, nd) => `${RC_INTERNAL.wClass}(${nd}, ${v})`), store }
-    }
-    if (kind === 'styles') {
-      return { value, guard: `${value} !== ${old}`, node, write: w(RC_INTERNAL.wStyle, (v, nd) => `${RC_INTERNAL.wStyle}(${nd}, ${v})`), store }
-    }
-    return undefined // 未知 directive 类型 → 回退
-  }
+
+  // 本函数**只处理非指令点**。指令点在两个调用方（generateRenderEffect /
+  // generateSubInlinedEffect）里都已先行 `continue`：结构指令走 dirEntryOf 选定的
+  // exec*/TAG 位指令走各自的内联 emit，两处都带完整 DirectiveInstance。
+  //
+  // 这里早前还留着一份指令分支（forEach/if*/show/bind/classes/styles…），已经不可达，
+  // 且 emit 的是**过期的 4 参形态** `execDir(rc, nd, v, old)` —— 新签名下 inst 为
+  // undefined，运行期首行 `if (!inst) return` 会让该点静默不响应且零报错。
+  // 保留它等于埋雷：谁把某个调用方的 continue 去掉，指令就会「安静地坏掉」。
+  if (up.isDirective) return undefined
 
   if (up.isText) {
     return {

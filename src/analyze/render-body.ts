@@ -47,8 +47,8 @@ interface ScanCtx {
   subDeps: Map<number, Set<string>>
   /** 子视图所属回调节点 start（inSub 时有效） */
   subKey: number
-  /** 遇到的降级信号 */
-  degrades: string[]
+  /** 遇到的阻断原因（D 系列：静态分析无法保证正确性） */
+  blockers: string[]
   /** 已访问节点，防止 oxc 节点上的意外回指造成无限递归 */
   seen: WeakSet<object>
   /**
@@ -71,20 +71,10 @@ interface ScanCtx {
  *
  * 从**最外层** MemberExpression 出发向内回溯；返回 `['a','b','c']`，
  * 非 this 起始或含 computed 访问时返回 null。
+ *
+ * 统一实现在 utils/oxc#thisChain。
  */
-function thisChain(node: any): string[] | null {
-  const chain: string[] = []
-  let cur: any = node
-  while (cur && (cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression')) {
-    if (cur.computed) return null // this[x] / a[x] → 动态访问
-    const name = keyName(cur.property)
-    if (!name) return null
-    chain.unshift(name)
-    cur = cur.object
-  }
-  if (!cur || cur.type !== 'ThisExpression') return null
-  return chain.length ? chain : null
-}
+import { thisChain } from '../utils/oxc'
 
 /** 记录一条依赖到当前作用域。 */
 function record(ctx: ScanCtx, path: string[]) {
@@ -158,8 +148,7 @@ export function collectLocals(bodyNodes: any[], into: Set<string>) {
     if (
       n.type === 'FunctionDeclaration' ||
       n.type === 'FunctionExpression' ||
-      n.type === 'ArrowFunctionExpression' ||
-      n.type === 'ClassDeclaration'
+      n.type === 'ArrowFunctionExpression'
     ) {
       // 嵌套函数自身的名字对当前作用域可见，但其内部声明不可见
       if (n.type === 'FunctionDeclaration' && n.id?.name) into.add(n.id.name)
@@ -210,6 +199,21 @@ function scanNode(ctx: ScanCtx, node: any, parent: any) {
     if (ctx.fnDepth === 0 && ctx.sinks) ctx.sinks.mainHits.push(node)
   }
 
+  // --- super 表达式：0.31 起 render() 内一律不支持 ---
+  // `super` 在 AST 里是独立的 `Super` 节点（不是 ThisExpression）。
+  //
+  // 为什么不静默放过：取值表达式会被内联进 `function(__comp, __d){…}` —— 那里没有
+  // home-object，`super` 是**语法错误**；而模板插值位（如 `${super.render()}`）不报错，
+  // 只会渲染出字面量。两种都是「构建通过、运行时坏掉」，必须在构建期拦下。
+  if (node.type === 'Super') {
+    ctx.blockers.push(
+      'E-SUPER-IN-TEMPLATE: render() 内不支持 super 表达式。' +
+        '基类请只保留 prop/state/computed/@watch/样式，视图下沉到叶子组件；' +
+        '需要复用的静态视图片段用模块级常量 + `${html(CONST)}`（同文件会折进建树序列）。',
+    )
+    return
+  }
+
   // --- 响应式字段访问：this.x / this.x.y.z ---
   // 只在「链的最外层」处理一次：多层链的内层节点（this.obj、this.obj.deep）由父节点统一记录，
   // 避免重复与路径截断。判定条件不能用 `node.object === ThisExpression`（那只覆盖单层），
@@ -228,7 +232,7 @@ function scanNode(ctx: ScanCtx, node: any, parent: any) {
         if (field) {
           record(ctx, chain)
         } else if (ctx.comp.ownMethods.has(root)) {
-          // 自有方法值不可变 → 不推入依赖，也不降级。
+          // 自有方法值不可变 → 不推入依赖，也不报阻断。
         } else {
           // 普通 getter（以及跨文件基类的未知成员）。
           //
@@ -238,7 +242,7 @@ function scanNode(ctx: ScanCtx, node: any, parent: any) {
           // 派生 getter 是生态里最常见的写法，不该因静态推不出而放弃静态管线。
           record(ctx, chain)
         }
-        // 自有方法调用（this.goto、this.fmt）不推入依赖，也不降级：值不可变、不影响正确性。
+        // 自有方法调用（this.goto、this.fmt）不推入依赖，也不报阻断：值不可变、不影响正确性。
       } else if (node.object?.type === 'ThisExpression' && node.computed) {
         // this[expr] 动态访问：静态推不出依赖，但内联产物里表达式按源改写 this→rc
         // 后每轮 effect 求值，取值经注入访问器读 __s.*.value 动态建链（build-vars 侧
@@ -292,7 +296,7 @@ function scanNode(ctx: ScanCtx, node: any, parent: any) {
     if (isFreeIdentifierRef(node.callee, node)) {
       const local = node.callee.name
       if (!ctx.bound.has(local) && !ctx.comp.compelemImports.has(local) && !isKnownGlobal(local)) {
-        ctx.degrades.push(`D3: render() 内调用未知自由标识符 ${local}()`)
+        ctx.blockers.push(`D3: render() 内调用未知自由标识符 ${local}()`)
       }
     }
   }
@@ -301,7 +305,7 @@ function scanNode(ctx: ScanCtx, node: any, parent: any) {
   if (node.type === 'Identifier' && isFreeIdentifierRef(node, parent)) {
     const local = node.name
     if (!ctx.bound.has(local) && !ctx.comp.compelemImports.has(local) && !isKnownGlobal(local)) {
-      ctx.degrades.push(`D3: render() 内出现未知自由标识符 ${local}`)
+      ctx.blockers.push(`D3: render() 内出现未知自由标识符 ${local}`)
     }
   }
 
@@ -350,14 +354,14 @@ export interface RenderAnalysis {
   viewDeps: string[]
   /** 子视图依赖：回调节点 start 偏移 → 路径列表 */
   subViewDeps: Map<number, string[]>
-  /** 降级原因列表（空表示未降级） */
-  degrades: string[]
+  /** 阻断原因列表（空表示通过）。非空 ⇒ `assertStaticAnalysis` 抛 `StaticAnalysisError`。 */
+  blockers: string[]
   /**
    * 硬性违规（当前只有 D7：模板内直接嵌套模板）。
    *
-   * 与 degrades 的区别：degrades 是「静态推不出，放弃注入（降级）」，
-   * errors 是「写法违反约束，必须改代码」——二者都导致降级，但 errors 需要在
-   * 构建期报给用户，因为它是可修的、且修掉后才能启用编译期产物。
+   * 与 `blockers` 都是「不可编译」，二者的区别只在**归因**：`blockers` 是
+   * 「静态推不出结论」（D0/D3/D4/D5/D6），`errors` 是「写法违反约束，用户可修」
+   * （D7）—— 故 errors 带源码区间，供构建期定位到具体位置。
    */
   errors: TemplateIssue[]
 }
@@ -376,7 +380,7 @@ export function analyzeRender(comp: ComponentAnalysis, sinks?: { mainHits: any[]
     mainDeps: new Set<string>(),
     subDeps: new Map<number, Set<string>>(),
     subKey: -1,
-    degrades: [],
+    blockers: [],
     seen: new WeakSet<object>(),
     bound,
     hAliases: collectTemplateTagAliases(comp),
@@ -386,15 +390,15 @@ export function analyzeRender(comp: ComponentAnalysis, sinks?: { mainHits: any[]
   }
   if (comp.renderBody) scan(ctx, comp.renderBody)
 
-  // 去重降级原因
-  const degrades = [...new Set(ctx.degrades)]
+  // 去重阻断原因
+  const blockers = [...new Set(ctx.blockers)]
   const subViewDeps = new Map<number, string[]>()
   for (const [k, v] of ctx.subDeps) subViewDeps.set(k, [...v])
 
   return {
     viewDeps: [...ctx.mainDeps],
     subViewDeps,
-    degrades,
+    blockers,
     errors: ctx.issues,
   }
 }

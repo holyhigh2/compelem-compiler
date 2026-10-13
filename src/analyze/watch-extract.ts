@@ -39,6 +39,15 @@ export interface WatchExtractResult {
   /** 需从源码删除的 @watch(...) 装饰器 span（已做整行清理） */
   removals: Array<{ start: number; end: number }>
   errors: ConventionError[]
+  /**
+   * `entries` 是否已并入**同文件**基类链的 @watch（祖先在前）。
+   *
+   * codegen 据此决定还要不要把父类 `__ce_static__.watchEffects` 拼进来：
+   * 同文件继承链上，最后一个同文件基类自己发射的 `watchEffects` 与已内联的
+   * 那段前缀**内容完全相同**，再拼一次会让同一批处理器被执行两次
+   * （immediate 处理器副作用翻倍）。
+   */
+  inlinedAncestors: boolean
 }
 /**
  * 生成 signal 模式 watch effect 工厂数组。
@@ -175,8 +184,12 @@ function boolOf(n: any): boolean | null {
  * `comp.fields` 只含本类**自身**成员（classInfoOf 不做基类合并），所以子类上
  * `@watch("title")`（title 来自父类 @state）会被误判为非信号。必须沿 extends 链上溯。
  *
- * 返回 null = 链上有本文件之外的基类 → 键集不可知，调用方应跳过校验（宁可放过，
- * 也不误伤）。这与「基类在别处」时组件本身通常已 D6 降级的情形一致。
+ * 返回 null = 键集**不可知**，调用方应跳过校验（宁可放过，也不误伤）。两种来源：
+ *   1. 链上有本文件之外的基类（不随本文件编译，字段不可穷举）；
+ *   2. 链上出现 `extends <工厂调用>` 形态的 **mixin** —— mixin 的 @prop/@state 落在
+ *      另一份 `__ce_static__` 里，同样不可穷举（见下方循环内的说明）。
+ * 这与「基类在别处」时组件通常已被 D6 阻断的情形一致；而 mixin 组件是**刻意放行**的
+ * （`component.ts` 的 `unknownSuperAdmitted → skipInjection`），故这条更不能误报。
  */
 function signalKeysOf(
   cls: any,
@@ -187,8 +200,18 @@ function signalKeysOf(
   const keys = new Set<string>(ownFields)
   let cur = cls
   for (let depth = 0; depth < 8; depth++) {
+    // 无 extends 子句 → 链到此为止，键集**完整可知**，可以直接返回。
+    if (!cur.superClass) return keys
     const sup = superClassName(cur)
-    if (!sup) return keys
+    // 有 extends 但基类不是可解析的标识符（`extends Virtualized(CompElem)` 这类
+    // **mixin 工厂调用**）→ mixin 贡献的 @prop/@state 编译进的是**另一个**
+    // __ce_static__，本文件里无法穷举 ⇒ 与「基类在别处」同构，返回 null 让调用方
+    // 跳过校验（宁可放过，也不误伤）。
+    // 反例（修复前的行为）：`class Tree extends Virtualized(CompElem)` 上
+    // `@watch('vRowHeight')`（vRowHeight 由 mixin 声明）会被误报 E-WATCH-SOURCE
+    // 而阻断构建 —— 这类组件在本分支之外是刻意放行的（component.ts 判
+    // unknownSuperAdmitted → skipInjection），所以必须在这里放行。
+    if (!sup) return null
     // CompElem 是框架基类，永远在链尾且不贡献响应式字段（slots 除外）——
     // 必须当终止条件返回已知键集，不能当成「本文件外的未知基类」而放弃校验，
     // 否则所有直接继承 CompElem 的组件（也就是绝大多数）都跳过检查。
@@ -278,7 +301,7 @@ export function extractWatchers(
   code: string,
   ctx: ConventionsContext,
 ): WatchExtractResult {
-  const result: WatchExtractResult = { entries: [], removals: [], errors: [] }
+  const result: WatchExtractResult = { entries: [], removals: [], errors: [], inlinedAncestors: false }
   const cls = comp.cls ?? ctx.localClasses.get(comp.className)
   if (!cls) return result
 
@@ -331,8 +354,8 @@ export function extractWatchers(
         }
         // source 必须是**真信号键**。生成的 effect 读 `rc.__s.<s>.value`，
         // 普通 getter / 不存在的成员会让 `__s[s]` 为 undefined → setup() 里直接抛错，
-        // 组件已降级时不做此检查（基类可能在本文件外，键集不全）。
-        if (own && !comp.degradeReason) {
+        // 故本检查在静态分析已判不合规时跳过（基类可能在本文件外，键集不全，误报）。
+        if (own && !comp.staticReason) {
           const signalKeys = signalKeysOf(node, ctx, comp, knownFields)
           if (signalKeys) {
             // 多级路径按**根键**判定（"a.b" 监听的是 __s.a）
@@ -406,7 +429,9 @@ export function extractWatchers(
   }
 
   // 1) 祖先条目（远 → 近），使父类处理器在子类实例上同样生效
-  for (const anc of ancestorChain()) collect(anc.node, anc.fields, false)
+  const chain = ancestorChain()
+  result.inlinedAncestors = chain.length > 0
+  for (const anc of chain) collect(anc.node, anc.fields, false)
   // 2) 本类条目 + removals + errors
   collect(cls, new Set(comp.fields.keys()), true)
   return result

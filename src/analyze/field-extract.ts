@@ -108,7 +108,7 @@ function observedGetter(h: (canon: string) => string): string {
  * **判据是「逐字节相同」而不是「同名」，因为同名不同语义是真实存在的**：
  *   · `@prop({model:true}) value` 的 setter 是 `writeModelProp(...)`（按宿主类型
  *     三路分派），而子类 `@prop value` 的 setter 是 `this.__s.value.value = __v`。
- *     两者文本不同 ⇒ 不跳过。若按「同名就跳」，子类会静默把 model prop 降级成普通
+ *     两者文本不同 ⇒ 不跳过。若按「同名就跳」，子类会静默把 model prop 退化成普通
  *     prop，父级再也收不到 `update:value` —— 无报错。
  *   · `@state` 与 `@prop` 同名时文本相同（都是读 `__s.<n>.value`）⇒ 可跳。
  *   · `@computed` 只有 getter，文本与同名 prop 的 getter 相同 ⇒ 可跳。

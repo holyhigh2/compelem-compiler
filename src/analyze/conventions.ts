@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 约定错误静态检查（对应运行时 showError/showTagError 中「可静态判定」的调用点）。
  *
  * 设计原则（对齐 docs/TEMPLATE-CODEGEN.md §5「仅静态编译」）：
@@ -22,7 +22,11 @@
  * 不可静态判定的调用点（转换器报错、required 缺失、forEach 重复 key 等）不在此处。
  */
 import type { ComponentAnalysis } from '../types'
-import { keyName } from '../utils/oxc'
+// unwrapTsExpr 是 unwrapExpr 的历史名（field-extract / method-deco-extract /
+// template-rules / literal-meta 仍在用），在此转出以免改动那些 import 路径。
+// 本文件原先那份实现**不认** TSTypeAssertion（`<T>x`），已随统一修正。
+import { decoratorName, keyName, superClassName, unwrapExpr } from '../utils/oxc'
+export { decoratorName, unwrapExpr as unwrapTsExpr }
 
 export interface ConventionError {
   start: number
@@ -44,32 +48,17 @@ export interface ConventionsContext {
    */
   moduleConsts?: Map<string, any>
   /**
+   * 模块级函数表（collectModuleFunctions 产物）：顶层 `function NAME() {}` 与
+   * `const NAME = 箭头/函数表达式`。用于模板约定检查 E-TEMPLATE-INTERP 判定
+   * 「插值位调用的本地函数是否返回 Template（子视图）」。不收类方法。
+   */
+  moduleFunctions?: Map<string, { node: any; annotatedTemplate: boolean }>
+  /**
    * U5：本文件源码（compileFile 注入，测试可缺省）。
    * collectThisUsage 的预筛依据——函数体切片不含 `this` 字面量即可跳过深度 walk
    * （emit/propAssign 赋值模式都要求 ThisExpression，源码必含 `this`）。
    */
   code?: string
-}
-
-export function decoratorName(dec: any): string | null {
-  const expr = dec?.expression ?? dec
-  if (!expr) return null
-  if (expr.type === 'CallExpression') {
-    const callee = expr.callee
-    if (callee?.type === 'Identifier') return callee.name
-    if (callee?.type === 'MemberExpression' && callee.property?.type === 'Identifier') return callee.property.name
-    return null
-  }
-  if (expr.type === 'Identifier') return expr.name
-  return null
-}
-
-function superClassName(node: any): string | null {
-  const sc = node.superClass
-  if (!sc) return null
-  if (sc.type === 'Identifier') return sc.name
-  if (sc.type === 'MemberExpression' && sc.property?.type === 'Identifier') return sc.property.name
-  return null
 }
 
 /** isStringLiteral：覆盖 oxc 的 Literal / StringLiteral 两种形态。 */
@@ -150,19 +139,83 @@ export function collectModuleConsts(program: any): Map<string, any> {
   return out
 }
 
-/** 剥掉 TS 包装节点（as / satisfies / 括号），取可静态分析的本体。 */
-export function unwrapTsExpr(n: any): any {
-  let cur = n
-  while (
-    cur &&
-    (cur.type === 'TSAsExpression' ||
-      cur.type === 'TSSatisfiesExpression' ||
-      cur.type === 'TSNonNullExpression' ||
-      cur.type === 'ParenthesizedExpression')
-  ) {
-    cur = cur.expression
+/**
+ * 收集模块级函数：顶层 `function NAME() {}` 与 `const NAME = (...) => ...` / `function`。
+ * 返回 名字 → { node, annotatedTemplate }，`annotatedTemplate` 表示返回类型注解为 `Template`。
+ * 用途：E-TEMPLATE-INTERP 判定插值位调用的本地函数是否产出子视图。
+ * 不收类方法（方法返回值无法在模块级静态证明）。
+ */
+export function collectModuleFunctions(
+  program: any,
+): Map<string, { node: any; annotatedTemplate: boolean }> {
+  const out = new Map<string, { node: any; annotatedTemplate: boolean }>()
+  const visit = (decl: any) => {
+    if (!decl) return
+    if (decl.type === 'FunctionDeclaration' && decl.id?.name) {
+      out.set(decl.id.name, { node: decl, annotatedTemplate: returnTypeIsTemplate(decl) })
+    }
+    if (decl.type === 'VariableDeclaration' && decl.kind === 'const') {
+      for (const d of decl.declarations ?? []) {
+        if (d.id?.type !== 'Identifier' || !d.init) continue
+        const init = d.init
+        if (init.type === 'ArrowFunctionExpression' || init.type === 'FunctionExpression') {
+          out.set(d.id.name, { node: init, annotatedTemplate: returnTypeIsTemplate(init) })
+        }
+      }
+    }
   }
-  return cur
+  for (const stmt of program?.body ?? []) {
+    const decl = stmt?.type === 'ExportNamedDeclaration' ? stmt.declaration : stmt
+    visit(decl)
+  }
+  return out
+}
+
+/** 函数返回类型注解是否为 `Template`（`function f(): Template` / `const f = (): Template =>`）。 */
+function returnTypeIsTemplate(fnNode: any): boolean {
+  const rt = fnNode.returnType
+  if (!rt) return false
+  const ann = rt.type === 'TSTypeAnnotation' ? rt.typeAnnotation : rt
+  if (ann?.type === 'TSTypeReference') {
+    const tn = ann.typeName
+    if (tn?.type === 'Identifier' && tn.name === 'Template') return true
+  }
+  return false
+}
+
+/**
+ * 函数体是否「返回 h`` 模板」（简写箭头 `() => h\`...\`` 或块体内任一 `return h\`...\``）。
+ * `hAliases` 来自 collectTemplateTagAliases(comp)，对齐 template-extract 的别名识别。
+ */
+export function bodyReturnsTemplate(fnNode: any, hAliases: Set<string>): boolean {
+  const body = fnNode.body
+  if (!body) return false
+  if (body.type !== 'BlockStatement') return isHCall(body, hAliases)
+  let found = false
+  const walk = (n: any) => {
+    if (!n || typeof n.type !== 'string' || found) return
+    if (n.type === 'ReturnStatement' && n.argument && isHCall(n.argument, hAliases)) {
+      found = true
+      return
+    }
+    for (const k of Object.keys(n)) {
+      if (k === 'start' || k === 'end' || k === 'type' || k === 'parent') continue
+      const v = n[k]
+      if (Array.isArray(v)) for (const x of v) walk(x)
+      else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v)
+    }
+  }
+  walk(body)
+  return found
+}
+
+function isHCall(node: any, hAliases: Set<string>): boolean {
+  const n = unwrapExpr(node)
+  return (
+    n?.type === 'TaggedTemplateExpression' &&
+    n.tag?.type === 'Identifier' &&
+    hAliases.has(n.tag.name)
+  )
 }
 
 /**
@@ -337,7 +390,7 @@ function decoratorOptionsNode(member: any, decName: string, isDec: (n: string) =
       const a0 = expr.arguments?.[0]
       if (a0?.type === 'ObjectExpression') return a0
       if (a0?.type === 'Identifier' && ctx?.moduleConsts?.has(a0.name)) {
-        const init = unwrapTsExpr(ctx.moduleConsts.get(a0.name))
+        const init = unwrapExpr(ctx.moduleConsts.get(a0.name))
         if (init?.type === 'ObjectExpression') return init
       }
       return null
@@ -357,7 +410,7 @@ function objectHasTrueProp(optsNode: any, key: string): boolean {
 
 /**
  * 对单个组件执行全部约定检查。返回错误列表（可为空）。
- * 注意：约定检查独立于模板 codegen 与降级判定 —— 降级组件同样检查。
+ * 注意：约定检查独立于模板 codegen 与静态分析闸门 —— 二者都会执行，不短路。
  */
 export function checkConventions(
   comp: ComponentAnalysis,
@@ -390,14 +443,14 @@ export function checkConventions(
 
     // 装饰器目标检查（与成员是否有函数体无关）
     const decs: string[] = (member.decorators ?? []).map(decoratorName).filter(Boolean) as string[]
-    if (memberName && isComputedDec('computed') && decs.includes('computed') && member.kind !== 'get') {
+    if (memberName && decs.some((d) => isComputedDec(d)) && member.kind !== 'get') {
       errs.push({
         start: member.start,
         end: member.end,
         message: `E-COMPUTED-NOT-GETTER: @computed 只能用于非静态 getter（'${memberName}' 是 ${member.kind ?? 'member'}）`,
       })
     }
-    if (memberName && isCsscopeDec('csscope') && decs.includes('csscope')) {
+    if (memberName && decs.some((d) => isCsscopeDec(d))) {
       if (!member.static || member.kind !== 'get') {
         errs.push({
           start: member.start,
