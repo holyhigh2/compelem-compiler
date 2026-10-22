@@ -14,6 +14,10 @@
 /** 与 compelem constants.ts PLACEHOLDER 完全一致（⟬ + Ċ + ⟭）。 */
 export const PLACEHOLDER = '⟬Ċ⟭'
 
+/** 整段恰为单个占位符（纯插值判定）；group1 = 插值序。消费方：template-dom NAME_TOKEN_RE、render-effect 纯 attr 判定。 */
+export const PLACEHOLDER_ONLY_RE = new RegExp(`^${PLACEHOLDER}(\\d+)$`)
+/** 首个占位符（含前后文的本段混合模板）；group1 = 插值序。 */
+export const PLACEHOLDER_FIRST_RE = new RegExp(`${PLACEHOLDER}(\\d+)`)
 const TOKEN_RE = new RegExp(`${PLACEHOLDER}(\\d+)`, 'g')
 
 /** HTML void 元素（不需要闭合标签）。 */
@@ -40,17 +44,17 @@ export interface TAttr {
 }
 
 export interface TElement {
-    type: 'element'
-    tag: string
-    attrs: TAttr[]
-    children: TNode[]
-    ns: 'html' | 'svg'
+  type: 'element'
+  tag: string
+  attrs: TAttr[]
+  children: TNode[]
+  ns: 'html' | 'svg'
 }
 
 export interface TText {
-    type: 'text'
-    raw: string
-    parts: TPart[]
+  type: 'text'
+  raw: string
+  parts: TPart[]
 }
 
 export interface TComment {
@@ -105,6 +109,20 @@ export interface TemplateTree {
 }
 
 /**
+ * 空白即内容的标签（rawtext 系 + `pre`）：这些标签下的空白/换行是**真内容**，
+ * 既不能被"纯排版空白"裁剪，也不能在 codegen 里 trim。
+ */
+export const WS_SENSITIVE_TAGS: ReadonlySet<string> = new Set([
+  'script',
+  'style',
+  'textarea',
+  'title',
+  'xmp',
+  'listing',
+  'pre',
+])
+
+/**
  * 解析源码级模板串为节点树。
  *
  * 抛出 `TemplateParseError` 表示源码写法不受 codegen 支持（静态编译下不允许回退）。
@@ -130,6 +148,7 @@ export function parseTemplateTree(
       const end = html.indexOf('-->', i + 4)
       if (end < 0) err('注释未闭合')
       const text = html.slice(i + 4, end)
+      TOKEN_RE.lastIndex = 0 // /g 正则：.test() 会从上次残留的 lastIndex 续扫 ⇒ 漏报
       if (TOKEN_RE.test(text)) err('注释内不允许出现模板插值（会被静默丢弃）')
       parent.push({ type: 'comment', text })
       i = end + 3
@@ -223,7 +242,7 @@ export function parseTemplateTree(
         }
       }
 
-      if (lower === 'svg') inSvg = true
+      if (lower === 'svg' && !selfClosing) inSvg = true
       if (lower === 'foreignobject') err('foreignObject 暂不支持（v1）')
 
       if (!selfClosing && !VOID_TAGS.has(lower)) {
@@ -265,18 +284,10 @@ export function parseTemplateTree(
   }
   if (seen.size !== varCount) err('模板中出现未知编号的插值槽')
 
-  // <transition> 在解包阶段显式拦截（见 unwrapList）
-  const newRoot = unwrapList(root)
-
   // 编译期剔除「仅排版用的空白文本」节点：源码换行/缩进会解析出不带占位符的
   // 纯空白 Text，它们在 innerHTML 路径里会变成空 Text 节点，白占 nodes[] 名额与
   // clone/effect 开销。判据：`raw` 全是空白（只含空格/Tab/换行）⇒ 纯排版空白。
-  //
-  // ⚠️ 代价（已知取舍）：`</b> <span>` 这类**同一行内**、两个内联元素之间的单个空格
-  // 也会被剔除，渲染时两者直接相邻。依赖该空格做视觉分隔的写法请改用 CSS
-  // （gap / margin）表达。rawtext 系（script/style/textarea/title/xmp/listing/pre）
-  // 的空白是真内容，一律不动。
-  const RAWTEXT = new Set(['script','style','textarea','title','xmp','listing','pre'])
+  const RAWTEXT = WS_SENSITIVE_TAGS
   const prune = (nodes: TNode[], parentTag: string | null): TNode[] => {
     if (parentTag !== null && RAWTEXT.has(parentTag)) return nodes
     const kept: TNode[] = []
@@ -292,32 +303,40 @@ export function parseTemplateTree(
     }
     return kept
   }
-  const pruned = prune(newRoot, null)
+  const pruned = prune(root, null)
   return { root: pruned }
+}
+
+/**
+ * 清除出现在**属性名/属性值**里的静态 HTML 常量折叠标记。
+ *
+ * `staticHtmlFragmentOf` 只看表达式形态，不知道它落在文本位还是属性位；
+ * 而折叠（inlineStaticFragments）只处理文本节点。属性位若保留 fragment 标记，
+ * build-vars 会跳过该 varIndex，但 emitAttr 仍会为它创建 up ⇒ 内部不变量错位。
+ * 属性位保留普通指令语义（TAG 位的 html 是合法用法；属性值位由 codegen 报错）。
+ */
+export function clearAttrFragments(
+  nodes: TNode[],
+  vars: ReadonlyArray<{ fragment?: string }>,
+): void {
+  const clear = (idx: number) => {
+    if (vars[idx]) vars[idx].fragment = undefined
+  }
+  const walk = (list: TNode[]) => {
+    for (const nd of list) {
+      if (nd.type !== 'element') continue
+      for (const a of nd.attrs) {
+        for (const p of a.parts) if (p.type === 'var') clear(p.index)
+        for (const p of splitParts(a.name)) if (p.type === 'var') clear(p.index)
+      }
+      walk(nd.children)
+    }
+  }
+  walk(nodes)
 }
 
 interface OpenTag {
   name: string
   lower: string
   node: TElement
-}
-
-function unwrapList(list: TNode[]): TNode[] {
-  const out: TNode[] = []
-  for (const nd of list) {
-    if (nd.type !== 'element') { out.push(nd); continue }
-    if (nd.tag.toLowerCase() === 'transition') {
-      // `<transition>` 伪标签不受支持。显式报错而不是当普通标签渲染
-      // —— 后者会在页面上留下一个真实的 <transition> 元素，且结构指令锚点丢失，
-      // 属于「构建通过但行为静默错误」，比构建失败难查一个数量级。
-      errT('<transition> 不受支持，请改用 CSS 动画或自行实现过渡逻辑')
-    }
-    nd.children = unwrapList(nd.children)
-    out.push(nd)
-  }
-  return out
-}
-
-function errT(msg: string): never {
-  throw new TemplateParseError(msg, -1)
 }

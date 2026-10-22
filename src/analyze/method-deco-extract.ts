@@ -4,23 +4,28 @@
  * 与 @watch / 五族前移同构（analyze/watch-extract.ts、field-extract.ts）：
  *   - 静态提取装饰器参数 → 生成**构造体注入语句**（逐条直线代码，无计划表、无运行时遍历）；
  *   - 从源码中删除装饰器本身（**方法体保留**）；
- *   - 生成 destroy 注入语句（cancel + 置 null）。
+ *   - 生成 destroy 注入语句（cancel + 置**空操作函数**）。
  *
  * 产物形态（对齐原运行时 `DebouncedDecorator.created` 等）：
  *
  *   @throttled(100) onScroll() { this.sync() }
  *   ⇒ 构造体：const __f0 = this.onScroll; this.onScroll = throttle(__f0, 100); this.onScroll_$__ = __f0
- *   ⇒ destroy：this.onScroll = null; this.onScroll_$__ = null
+ *   ⇒ destroy：this.onScroll = () => {}; this.onScroll_$__ = () => {}
  *
  *   @debounced(50, true) onSearch(kw) { … }
  *   ⇒ 构造体：const __f1 = this.onSearch;
  *             const __g1 = function (...a) { if (this?.isDestroyed) return; return __f1.apply(this, a) }
  *             this.onSearch = debounce(__g1, 50, true); this.onSearch_$__ = __g1
- *   ⇒ destroy：this.onSearch?.cancel?.(); this.onSearch = null; this.onSearch_$__ = null
+ *   ⇒ destroy：this.onSearch?.cancel?.(); this.onSearch = () => {}; this.onSearch_$__ = () => {}
  *
  *   @onced init() { … }
  *   ⇒ 构造体：const __f2 = this.init.bind(this); this.init = once(__f2); this.init_$__ = __f2
- *   ⇒ destroy：this.init = null; this.init_$__ = null
+ *   ⇒ destroy：this.init = () => {}; this.init_$__ = () => {}
+ *
+ * ⚠️ destroy 里**置空操作函数而非 null**：库里存在若干「一次性定时器 / 手工 debounce」
+ * 的迟到回调，会在组件销毁后仍直接 `this.decoMethod()`。若置 null 会抛
+ * "X is not a function"；置 no-op 则静默无害（这些方法本就只在存活期有意义）。
+ * 注意 no-op 是**真值**（null 是假值），故不要依赖销毁后 `if (this.X)` 为假。
  *
  * ⚠️ **三个装饰器的 `_$__` 语义各不相同**（已实测确认）：
  *   - debounced：包裹 **guard**（含 isDestroyed），`_$__` **也是 guard**
@@ -31,15 +36,14 @@
  * ⚠️ **必须先把原型方法捞进临时变量**（`const __f = this.onX`）：包装后
  * `this.onX` 即指向包装结果，再取就是递归。
  *
- * ⚠️ **继承**：只删**本类 own** 的装饰器（祖先在自己所在文件/类里删）。
- * 但注入语句**必须含祖先条目**（祖先在前）—— 见 §继承说明于 collect 调用处。
+ * ⚠️ **继承**：只处理**本类 own** 的装饰器。祖先的 constructor 已经执行过自己的
+ * 包装注入；子类再注入一遍会造成 debounce/throttle 双层包装与 _$__ 覆盖。
  *
  * **逐族 all-or-nothing + 失败即报错**：任一成员参数不可静态解析 → 该族整体
  * 不删不注并报 E 码。运行时装饰器已无定义路径，E 码是唯一保护。
  */
 import type { ComponentAnalysis } from '../types'
-import { keyName } from '../utils/oxc'
-import { superClassName } from './component'
+import { keyName, IDENT_RE } from '../utils/ast'
 import { decoratorName, unwrapTsExpr, type ConventionError, type ConventionsContext } from './conventions'
 import { isBooleanLit, isNumericLit, isNumericUnary } from './literal-meta'
 import { lineSpan } from './watch-extract'
@@ -61,6 +65,8 @@ type Kind = 'debounced' | 'throttled' | 'onced'
 /** 本地变量前缀（避开用户标识符；`__` 前缀与框架其余注入一致）。 */
 const TMP_F = '__ce_mdf'
 const TMP_G = '__ce_mdg'
+/** destroy 时给装饰器方法（及其 `_$__`）写入的空操作实现（见文件头注释）。 */
+const NOOP = '() => {}'
 
 /**
  * 提取组件类上的方法装饰器。祖先条目并入（祖先在前），但 removals 只记本类。
@@ -74,29 +80,12 @@ export function extractMethodDecos(
   const cls = comp.cls ?? ctx.localClasses.get(comp.className)
   if (!cls) return result
 
-  const aliases = new Set(comp.compelemImports.values())
   const kindOf = (local: string): Kind | null => {
     const imported = comp.compelemImports.get(local)
     if (imported === 'debounced') return 'debounced'
     if (imported === 'throttled') return 'throttled'
     if (imported === 'onced') return 'onced'
     return null
-  }
-
-  /** 沿 extends 链上溯同文件基类，返回 [最远祖先 … 直接父类] */
-  const ancestorChain = (): any[] => {
-    const chain: any[] = []
-    let cur = cls
-    for (let depth = 0; depth < 8; depth++) {
-      const sup = superClassName(cur)
-      if (!sup) break
-      if (aliases.has(sup) && sup === 'CompElem') break
-      const parent = ctx.localClasses.get(sup)
-      if (!parent) break // 基类在本文件外，其装饰器由其自身文件处理
-      chain.push(parent)
-      cur = parent
-    }
-    return chain.reverse()
   }
 
   /** 全局计数器，保证临时变量名不冲突（祖先 + 本类共用一个序列）。 */
@@ -106,7 +95,7 @@ export function extractMethodDecos(
 
   /**
    * 解析 `wait`：数字字面量（含一元负号）/ 模块级 `const` 数字。
-   * ⚠️ oxc 走 ESTree 形态 —— 是 `Literal` + `value`，**不是** `NumericLiteral`。
+   * ⚠️ ESTree 形态 —— 是 `Literal` + `value`，**不是** `NumericLiteral`。
    * 故必须用 literal-meta 的判定函数，不能直接比 `type === 'NumericLiteral'`
    * （曾因此让 `@debounced(50)` 全部误报 E-METHOD-DECO-ARG）。
    */
@@ -144,11 +133,8 @@ export function extractMethodDecos(
     return null
   }
 
-  /**
-   * 处理单个类节点。
-   * @param own true = 本类（记 removals / errors）；false = 祖先（只产出注入语句）
-   */
-  const collect = (node: any, own: boolean): void => {
+  /** 处理本类节点（祖先 constructor 已自行完成包装，不能重复注入）。 */
+  const collect = (node: any): void => {
     const push = (s: string) => { result.ctorStmts += (result.ctorStmts ? '\n' : '') + s }
 
     const handle = (member: any, dec: any): void => {
@@ -158,19 +144,27 @@ export function extractMethodDecos(
       if (!dn) return
       const kind = kindOf(dn)
       if (!kind) return
+      // 目标校验由 checkConventions 的 E-DECO-TARGET 负责；这里只拒绝“明显不能包装”
+      // 的形态，避免 conventions: 'warn' 时产出 `this.getter = ...` 这类运行期崩溃。
+      if (member.kind !== 'method' || member.static || memberName.startsWith('#')) return
 
       const expr = dec.expression ?? dec
       const args: any[] = expr.type === 'CallExpression' ? (expr.arguments ?? []) : []
 
       const fail = (msg: string) => {
         failed = true
-        if (own) {
-          result.errors.push({
-            start: dec.start ?? expr.start ?? member.start,
-            end: dec.end ?? expr.end ?? member.end,
-            message: msg,
-          })
-        }
+        result.errors.push({
+          start: dec.start ?? expr.start ?? member.start,
+          end: dec.end ?? expr.end ?? member.end,
+          message: msg,
+        })
+      }
+
+      // 产物 emit `this.<name>` / `this.<name>_$__` 点访问：字符串字面量方法名
+      // （`'my-fn'(){}`）经 keyName 取出后不是合法标识符，直接拼接会产出非法 JS
+      if (!IDENT_RE.test(memberName)) {
+        fail(`E-METHOD-DECO-ARG: @${kind} 目标方法名 '${memberName}' 不是合法标识符，无法前移（产物为 this.<name> 点访问）`)
+        return
       }
 
       if (kind === 'onced') {
@@ -181,7 +175,7 @@ export function extractMethodDecos(
         push(`this.${memberName} = once(${f});`)
         push(`this.${memberName}_$__ = ${f};`)
         result.destroyStmts += (result.destroyStmts ? '\n' : '') +
-          `this.${memberName} = null; this.${memberName}_$__ = null;`
+          `this.${memberName} = ${NOOP}; this.${memberName}_$__ = ${NOOP};`
         usedHelpers.add('once')
       } else {
         const waitArg = args[0]
@@ -211,21 +205,19 @@ export function extractMethodDecos(
           push(`this.${memberName} = debounce(${g}, ${wait}, ${immediate});`)
           push(`this.${memberName}_$__ = ${g};`)
           result.destroyStmts += (result.destroyStmts ? '\n' : '') +
-            `this.${memberName}?.cancel?.(); this.${memberName} = null; this.${memberName}_$__ = null;`
+            `this.${memberName}?.cancel?.(); this.${memberName} = ${NOOP}; this.${memberName}_$__ = ${NOOP};`
           usedHelpers.add('debounce')
         } else {
           // throttled：包装原函数，_$__ 即原函数（**无 guard**）
           push(`this.${memberName} = throttle(${f}, ${wait});`)
           push(`this.${memberName}_$__ = ${f};`)
           result.destroyStmts += (result.destroyStmts ? '\n' : '') +
-            `this.${memberName} = null; this.${memberName}_$__ = null;`
+            `this.${memberName} = ${NOOP}; this.${memberName}_$__ = ${NOOP};`
           usedHelpers.add('throttle')
         }
       }
 
-      if (own) {
-        result.removals.push(lineSpan(code, dec.start ?? expr.start - 1, dec.end ?? expr.end))
-      }
+      result.removals.push(lineSpan(code, dec.start ?? expr.start - 1, dec.end ?? expr.end))
     }
 
     for (const member of node.body?.body ?? []) {
@@ -236,10 +228,9 @@ export function extractMethodDecos(
     }
   }
 
-  // 1) 祖先条目（远 → 近）：使父类声明的装饰器在子类实例上同样生效
-  for (const anc of ancestorChain()) collect(anc, false)
-  // 2) 本类条目 + removals + errors
-  collect(cls, true)
+  // 只处理本类：同文件祖先的 constructor 已经包装过；跨文件祖先也由各自文件处理。
+  // 再注入一遍会造成 debounce(throttle) 双层包装与 _$__ 覆盖。
+  collect(cls)
 
   // ⚠️ 用户已声明 own `beforeDestroyed` ⇒ **整体放弃前移并报 E 码**。
   // 原因：清理语句要注入成一个 `beforeDestroyed()` 重写，若用户已有一个，注入会

@@ -13,21 +13,20 @@
  * - 任一回调提取失败 → SubExtractError → 整组件报错阻断构建。
  */
 import type { ComponentAnalysis } from '../types'
+import { blockedTsText, collectPatternNames, containsBlockedTsNode, parseUncached, topLevelReturns, unwrapExpr } from '../utils/ast'
 import { COMpelem_DIRECTIVES, TEMPLATE_ARG_INDEX } from './render-body'
+import { stripTs, stripTsChecked } from './strip-ts'
+import { collectTemplateTagAliases } from './template'
 import {
   TAG_ONLY_DIRECTIVES,
-  TS_SYNTAX_RE,
   TemplateExtractError,
   extractThisChainPaths,
   staticHtmlFragmentOf,
-  type MainTemplate,
   type TemplateVarInfo,
 } from './template-extract'
-import { collectTemplateTagAliases } from './template'
-import { stripTs } from './strip-ts'
-import { topLevelReturns, unwrapExpr } from '../utils/oxc'
+import type { TemplateTree } from './template-tree'
 
-export class SubExtractError extends Error {}
+export class SubExtractError extends Error { }
 
 /** 指令实参分区：与 render-body 的 TEMPLATE_ARG_INDEX 同语义。 */
 export function partitionDirectiveArgs(directive: string, args: any[]): boolean[] {
@@ -61,24 +60,15 @@ export interface SubCandidate {
   strings: string[]
   /** h`` 插值的绝对偏移与源码 */
   vars: TemplateVarInfo[]
-  /**
-   * 拥有本回调的结构指令的「集合实参」源码（仅 forEach；其余 undefined）。
-   * 例：`forEach(this.rows, ...)` → `'this.rows'`。
-   *
-   * 用途：子模板 per-point effect 需要一个**信号**依赖。item 形参本身不是信号
-   * （`${cell}` 的 cell 是普通参数），只有集合信号可订阅——没有它，整表替换
-   * 集合不会通知任何 <td> 的文本点。嵌套子模板（`forEach(r.cells, ...)`）的
-   * 集合是 `r.cells`，`r` 也是形参，故须沿 enclosingCandidates 上溯到最外层
-   * 可解析为 `this.x` 的集合（见 subCollectionRoot）。
-   */
-  collectionExpr?: string
+  /** 解析后的模板树（compile.ts 预解析，供折叠/编号复用，避免重复 parse）。 */
+  tree?: TemplateTree
 }
 
 // ---------- TS 剥离（prelude / 回调体常见 `x!` 后缀非空断言） ----------
 // 实现已移到零依赖模块 ./strip-ts：`template-extract` 也要用它（分析期须
-// stripTs → TS 复检，与 codegen 同序），而本文件已 import 了 template-extract，
+// stripTs → hasTsSyntax 复检，与 codegen 同序），而本文件已 import 了 template-extract，
 // 反向 import 会形成模块环。这里保留同名再导出，现有调用方无需改动。
-export { stripTs }
+export { stripTs, stripTsChecked }
 
 /**
  * 在绝对区间 [absStart, absEnd) 内为候选回调插入 Object.assign(..., {__subId: N}) 包装。
@@ -144,15 +134,30 @@ export function applySubIdWraps(
   return render(absStart, absEnd, sorted)
 }
 
-/** 从 params 源码片段提取形参基名（`item = 1` → `item`；`...rest` → `rest`；解构取标识符）。 */
+/**
+ * 从 params 源码片段提取全部**真实绑定名**（`item = 1` → `item`；`...rest` → `rest`；
+ * `({row: r})` → 只有 `r`——`row` 是属性键不是绑定）。
+ */
 export function paramBaseNames(params: readonly string[]): Set<string> {
   const out = new Set<string>()
   for (const p of params) {
-    let s = p.trim()
-    if (s.startsWith('...')) s = s.slice(3)
-    const eq = s.indexOf('=')
-    if (eq >= 0) s = s.slice(0, eq)
-    const idents = s.match(/[A-Za-z_$][\w$]*/g)
+    const s = p.trim()
+    let parsed = false
+    try {
+      const pf = parseUncached(`function __ce_pf(${s}) {}`)
+      const fn = pf.program.body?.[0]
+      if (fn?.type === 'FunctionDeclaration') {
+        for (const pat of fn.params ?? []) collectPatternNames(pat, out)
+        parsed = true
+      }
+    } catch {
+      parsed = false
+    }
+    if (parsed) continue
+    let t = s.startsWith('...') ? s.slice(3) : s
+    const eq = t.indexOf('=')
+    if (eq >= 0) t = t.slice(0, eq)
+    const idents = t.match(/[A-Za-z_$][\w$]*/g)
     if (idents) for (const id of idents) out.add(id)
   }
   return out
@@ -178,6 +183,20 @@ export function enclosingCandidates(
 
 // ---------- 形参源码 ----------
 
+/**
+ * 形参默认值源码：与其它形参分支同一道 stripTs → hasTsSyntax 复核，外加旧式
+ * 尖括号断言 / 显式实例化的 AST 门（C-G6）。
+ * 直接切片会让 `= 3 as number` / `= x!` / `= <Foo>x` / `= f<T>(x)` 这类 TS 专有形态原样
+ * 进入产物（codegen 产物必须是纯 JS），默认值正是唯一被漏掉的入口。
+ */
+function paramInitSource(init: any): string {
+  const s = sliceNode(init)
+  if (containsBlockedTsNode(init)) throw new SubExtractError(blockedTsText('回调形参默认值', s))
+  const { stripped, tsHit } = stripTsChecked(s)
+  if (tsHit) throw new SubExtractError(`回调形参默认值含 TS 语法：${s}`)
+  return stripped
+}
+
 function paramsSource(fn: any): string[] {
   const out: string[] = []
   for (const p of fn.params ?? []) {
@@ -186,13 +205,14 @@ function paramsSource(fn: any): string[] {
       out.push(p.name)
     } else if (t === 'AssignmentPattern') {
       const left = paramsPattern(p.left)
-      out.push(p.init ? `${left} = ${sliceNode(p.init)}` : left)
+      out.push(p.init ? `${left} = ${paramInitSource(p.init)}` : left)
     } else if (t === 'RestElement') {
       out.push('...' + paramsPattern(p.argument))
     } else {
       const s = sliceNode(p)
-      const stripped = stripTs(s)
-      if (TS_SYNTAX_RE.test(stripped)) throw new SubExtractError(`回调形参含 TS 语法：${s}`)
+      if (containsBlockedTsNode(p)) throw new SubExtractError(blockedTsText('回调形参', s))
+      const { stripped, tsHit } = stripTsChecked(s)
+      if (tsHit) throw new SubExtractError(`回调形参含 TS 语法：${s}`)
       out.push(stripped)
     }
   }
@@ -207,13 +227,14 @@ function paramsPattern(pat: any): string {
     case 'ObjectPattern':
     case 'ArrayPattern': {
       const s = sliceNode(pat)
-      const stripped = stripTs(s)
-      if (TS_SYNTAX_RE.test(stripped)) throw new SubExtractError(`回调解构形参含 TS 语法：${s}`)
+      if (containsBlockedTsNode(pat)) throw new SubExtractError(blockedTsText('回调解构形参', s))
+      const { stripped, tsHit } = stripTsChecked(s)
+      if (tsHit) throw new SubExtractError(`回调解构形参含 TS 语法：${s}`)
       return stripped
     }
     case 'AssignmentPattern': {
       const left = paramsPattern(pat.left)
-      return pat.init ? `${left} = ${sliceNode(pat.init)}` : left
+      return pat.init ? `${left} = ${paramInitSource(pat.init)}` : left
     }
     case 'RestElement':
       return '...' + paramsPattern(pat.argument)
@@ -238,8 +259,6 @@ interface CollectCtx {
   hAliases: Set<string>
   candidates: any[] // 未赋 subId 的裸 fn 节点
   seen: WeakSet<object>
-  /** fn 节点 → 拥有它的 forEach 的集合实参源码 */
-  collections: Map<object, string>
 }
 
 function isDirectiveCall(node: any, comp: ComponentAnalysis): string | null {
@@ -253,18 +272,10 @@ function isDirectiveCall(node: any, comp: ComponentAnalysis): string | null {
 
 function collectFromArgs(ctx: CollectCtx, directive: string, args: any[]): void {
   const flags = partitionDirectiveArgs(directive, args)
-  // forEach 的 arg0 = 集合实参：记录源码供子模板 effect 建立信号依赖
-  let collectionExpr: string | undefined
-  if (directive === 'forEach' && args[0] && typeof args[0].type === 'string') {
-    collectionExpr = __source.slice(args[0].start, args[0].end).trim()
-  }
   args.forEach((arg, i) => {
     if (!arg || typeof arg.type !== 'string') return
     const isTemplate = flags[i]
     if (isTemplate && isFnNode(arg)) {
-      if (collectionExpr !== undefined && !ctx.collections.has(arg)) {
-        ctx.collections.set(arg, collectionExpr)
-      }
       if (!ctx.candidates.includes(arg)) ctx.candidates.push(arg)
       walkCollect(ctx, arg)
       return
@@ -280,11 +291,14 @@ function collectFromArgs(ctx: CollectCtx, directive: string, args: any[]): void 
     if (isTemplate) {
       throw new SubExtractError(
         `@${directive} 的第 ${i + 1} 个模板实参不是字面量函数（实参类型 ${arg.type}）。` +
-          `结构指令的模板回调必须是 render() 内直接书写的箭头函数/函数表达式：` +
-          `变量引用、调用结果、条件表达式等都无法静态提取子模板。`,
+        `结构指令的模板回调必须是 render() 内直接书写的箭头函数/函数表达式：` +
+        `变量引用、调用结果、条件表达式等都无法静态提取子模板。`,
       )
     }
-    // 非模板实参：继续下钻找嵌套指令
+    // 非模板实参：继续下钻找嵌套指令；但**函数体不下钻**（keyFn / show 回调等
+    // 不是子模板位，其中的指令形态调用属运行期行为，收集会把用户回调错当
+    // 子模板包装成死代码）
+    if (isFnNode(arg)) return
     walkCollect(ctx, arg)
   })
 }
@@ -296,14 +310,14 @@ function collectWhenCases(ctx: CollectCtx, cases: any): void {
       if (prop.type === 'SpreadElement') {
         throw new SubExtractError(
           `when 的 cases 含展开运算符（…${prop.argument?.type ?? '未知'}）。` +
-            `展开进来的分支编译器看不到，无法分配 __subId；请把各分支改为显式键值对。`,
+          `展开进来的分支编译器看不到，无法分配 __subId；请把各分支改为显式键值对。`,
         )
       }
       const val = prop.value
       if (!isFnNode(val)) {
         throw new SubExtractError(
           `when 的 cases 键「${prop.key?.name ?? prop.key?.value ?? '?'}」的值不是字面量函数（${val?.type ?? '未知'}）。` +
-            `每个分支必须是 render() 内直接书写的箭头函数/函数表达式。`,
+          `每个分支必须是 render() 内直接书写的箭头函数/函数表达式。`,
         )
       }
       if (!ctx.candidates.includes(val)) ctx.candidates.push(val)
@@ -322,13 +336,14 @@ function collectWhenCases(ctx: CollectCtx, cases: any): void {
       if (el.type === 'ArrayExpression') {
         // [condFn, tmplFn]
         const els = el.elements ?? []
-        if (els[0]) walkCollect(ctx, els[0])
+        // 条件位不是子模板位：函数体不下钻（同 collectFromArgs 非模板实参）
+        if (els[0] && !isFnNode(els[0])) walkCollect(ctx, els[0])
         const tmpl = els[1]
         if (!tmpl) continue
         if (!isFnNode(tmpl)) {
           throw new SubExtractError(
             `when 的 [条件, 模板] 数对里模板位不是字面量函数（${tmpl.type}）。` +
-              `模板回调必须是 render() 内直接书写的箭头函数/函数表达式。`,
+            `模板回调必须是 render() 内直接书写的箭头函数/函数表达式。`,
           )
         }
         if (!ctx.candidates.includes(tmpl)) ctx.candidates.push(tmpl)
@@ -344,8 +359,8 @@ function collectWhenCases(ctx: CollectCtx, cases: any): void {
   // 非字面量（Identifier / 条件表达式 / 调用结果等）→ 无法枚举分支，构建期阻断
   throw new SubExtractError(
     `when 的 cases 不是字面量（${cases.type}）。` +
-      `编译器必须看到完整的分支列表才能逐个分配 __subId；` +
-      `变量引用、条件表达式、调用结果都无法静态提取，请改为内联对象/数组字面量。`,
+    `编译器必须看到完整的分支列表才能逐个分配 __subId；` +
+    `变量引用、条件表达式、调用结果都无法静态提取，请改为内联对象/数组字面量。`,
   )
 }
 
@@ -360,12 +375,20 @@ function walkCollect(ctx: CollectCtx, node: any): void {
     return
   }
 
-  // 普通嵌套继续下钻（含非指令回调体内的指令）
+  // 普通嵌套继续下钻，但**函数体不下钻**：事件 handler、非模板位回调不是子模板
+  // 位，其中的指令形态调用不应被收集（旧行为会把 handler 内的指令当子模板分配
+  // __subId 并把回调体包装成死代码；不可达位置的非字面量 when cases 还会抛
+  // SubExtractError 阻断整个组件）。模板位的函数体由 collectFromArgs /
+  // collectWhenCases 对 fn 节点**显式**调用 walkCollect 进入（直接入参不受
+  // 此处的子节点跳过影响），子模板分配语义不变。
   for (const key of Object.keys(node)) {
     if (key === 'type' || key === 'start' || key === 'end' || key === 'parent') continue
     const c = node[key]
-    if (Array.isArray(c)) for (const x of c) walkCollect(ctx, x)
-    else if (c && typeof c === 'object' && typeof c.type === 'string') walkCollect(ctx, c)
+    if (Array.isArray(c)) {
+      for (const x of c) if (!isFnNode(x)) walkCollect(ctx, x)
+    } else if (c && typeof c === 'object' && typeof c.type === 'string' && !isFnNode(c)) {
+      walkCollect(ctx, c)
+    }
   }
 }
 
@@ -444,11 +467,28 @@ function buildCandidate(ctx: CollectCtx, fn: any): SubCandidate {
       preludeStart = stmts[0].start
       preludeEnd = stmts[retIdx - 1].end
       preludeSrc = __source.slice(preludeStart, preludeEnd)
+      for (let si = 0; si < retIdx; si++) {
+        if (containsBlockedTsNode(stmts[si])) {
+          throw new SubExtractError(
+            blockedTsText(`子模板 @${fn.start} 的 prelude`, __source.slice(stmts[si].start, stmts[si].end)),
+          )
+        }
+      }
     }
   }
 
   const quasi: any = hit.quasi
-  const strings: string[] = (quasi.quasis ?? []).map((q: any) => String(q.value?.cooked ?? ''))
+  // 与主模板同判据：cooked == null = 非法转义（如 `C:\users`），静默取 '' 会丢字
+  const strings: string[] = (quasi.quasis ?? []).map((q: any, qi: number) => {
+    if (q.value?.cooked == null) {
+      const raw = typeof q.start === 'number' && typeof q.end === 'number' ? __source.slice(q.start, q.end) : ''
+      throw new SubExtractError(
+        `子模板 @${fn.start} 的第 ${qi} 段静态文本含非法转义序列（偏移 ${q.start ?? '?'}）：` +
+        `\`${raw}\`；模板串里 \\u、\\x 后必须是合法转义（路径等请写 \\\\），否则该段文本无法取值`,
+      )
+    }
+    return String(q.value.cooked)
+  })
   const exprs: any[] = quasi.expressions ?? []
   const vars: TemplateVarInfo[] = exprs.map((e: any, index: number) => {
     const exprSource = __source.slice(e.start, e.end).trim()
@@ -490,6 +530,7 @@ function buildCandidate(ctx: CollectCtx, fn: any): SubCandidate {
       fragment,
       start: e.start,
       end: e.end,
+      node: e,
     }
   })
 
@@ -523,7 +564,6 @@ export function collectSubCandidates(comp: ComponentAnalysis, source: string): S
       hAliases,
       candidates: [],
       seen: new WeakSet<object>(),
-      collections: new Map<object, string>(),
     }
     const body = Array.isArray(comp.renderBody) ? comp.renderBody : [comp.renderBody]
     for (const stmt of body) walkCollect(ctx, stmt)
@@ -536,8 +576,6 @@ export function collectSubCandidates(comp: ComponentAnalysis, source: string): S
     return nodes.map((fn, i) => {
       const cand = buildCandidate(ctx, fn)
       cand.subId = i
-      const coll = ctx.collections.get(fn)
-      if (coll !== undefined) cand.collectionExpr = coll
       return cand
     })
   } catch (e) {
@@ -547,6 +585,3 @@ export function collectSubCandidates(comp: ComponentAnalysis, source: string): S
     __source = prevSource
   }
 }
-
-/** 从 MainTemplate 提取失败时的兼容出口（D7 等在 extractMainTemplate 抛 TemplateExtractError）。 */
-export type { MainTemplate }

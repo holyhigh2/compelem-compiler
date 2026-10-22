@@ -3,15 +3,16 @@
  */
 import { analyzeFile, collectLocalClasses, collectModuleBindings, isCompelemSource, isMyfxSource } from './analyze/component'
 import { checkConventions, collectModuleConsts, collectModuleFunctions, collectStringConsts } from './analyze/conventions'
-import { assertStaticAnalysis, StaticAnalysisError } from './analyze/static-gate'
 import { extractComputedDeps, extractCssDeps } from './analyze/deps-extract'
 import { extractFieldAccessors, RUNTIME_HELPERS } from './analyze/field-extract'
+import { inlineTemplateMethodsWithEdits, type Edit as InlineEdit } from './analyze/inline-template-methods'
 import { extractMethodDecos } from './analyze/method-deco-extract'
 import { analyzeRender } from './analyze/render-body'
-import { extractMainTemplate, TemplateExtractError, TS_SYNTAX_RE } from './analyze/template-extract'
-import { checkTemplateRules } from './analyze/template-rules'
-import { collectSubCandidates, enclosingCandidates, paramBaseNames, stripTs, SubExtractError } from './analyze/template-subs'
-import { buildTemplateHTML, parseTemplateTree, TemplateParseError } from './analyze/template-tree'
+import { assertStaticAnalysis, StaticAnalysisError } from './analyze/static-gate'
+import { extractMainTemplate, TemplateExtractError, varsByUpIndex } from './analyze/template-extract'
+import { checkDirectiveArgs, checkTemplateRules } from './analyze/template-rules'
+import { collectSubCandidates, enclosingCandidates, paramBaseNames, stripTsChecked, SubExtractError } from './analyze/template-subs'
+import { buildTemplateHTML, clearAttrFragments, parseTemplateTree, TemplateParseError } from './analyze/template-tree'
 import { extractWatchers, generateWatchEffects, type WatchEntry } from './analyze/watch-extract'
 import { generateBuildVars, generateSubBuildVars, rewriteThis, type BuildVarsOptions } from './codegen/build-vars'
 import { buildStaticLiteral, emitFamily, emitWatchEffects, injectInto, planCtorInsert, type CtorInsertPlan } from './codegen/inject'
@@ -19,49 +20,121 @@ import { buildSubInliner, generateRenderEffect, generateSubInlinedEffect } from 
 import { generateBuildTemplate, type UpOut } from './codegen/template-dom'
 import type { CompilerOptions, ComponentAnalysis } from './types'
 import { DEBUG_DIV } from './types'
-import { parse } from './utils/oxc'
+import { collectPatternNames, parse, parseUncached, unwrapExpr } from './utils/ast'
+import { degradePrivateNames } from './utils/js-text'
+
+/** 方法装饰器（@debounced/@throttled/@onced）前移所需的 myfx helper，与 RUNTIME_HELPERS 共用别名机制。 */
+const MYFX_HELPERS = ['debounce', 'throttle', 'once'] as const
 
 /**
- * 收集主模板 prelude（render() 中 return 前的顶层语句）声明的局部变量名
- * （含解构 pattern 与函数声明）。收集失败（parse 异常）返回空集——此时
- * fx 工厂不会注入 prelude，表达式引用局部变量会由 buildVars 门禁报错拦截。
+ * 收集 prelude 里**在函数作用域内可见**的声明名
  */
 function collectPreludeDeclNames(rawPrelude: string, out: Set<string>): void {
   if (!rawPrelude) return
   let body: any
   try {
-    const parsed = parse(`(function(){ ${rawPrelude} })`, 'prelude-names.js')
+    const parsed = parseUncached(`(function(){ ${degradePrivateNames(rawPrelude)} })`)
     body = parsed.program?.body?.[0]?.expression?.body
   } catch {
     return
   }
   if (!body) return
-  const addPattern = (p: any): void => {
-    if (!p) return
-    switch (p.type) {
-      case 'Identifier':
-        out.add(p.name)
-        break
-      case 'ObjectPattern':
-        for (const pr of p.properties ?? []) addPattern(pr.type === 'RestElement' ? pr.argument : pr.value ?? pr.key)
-        break
-      case 'ArrayPattern':
-        for (const el of p.elements ?? []) addPattern(el)
-        break
-      case 'AssignmentPattern':
-        addPattern(p.left)
-        break
-      case 'RestElement':
-        addPattern(p.argument)
-        break
+
+  /**
+   * @param top 是否处于函数体顶层（顶层 let/const/function/class 才可见）
+   */
+  const walkStmts = (stmts: any[] | undefined, top: boolean): void => {
+    for (const stmt of stmts ?? []) if (stmt) walkStmt(stmt, top)
+  }
+
+  const walkStmt = (stmt: any, top: boolean): void => {
+    switch (stmt.type) {
+      case 'VariableDeclaration': {
+        // var 提升到函数作用域（任意深度可见）；let/const 只有顶层那份可见。
+        if (stmt.kind === 'var' || top) {
+          for (const d of stmt.declarations ?? []) collectPatternNames(d.id, out)
+        }
+        return
+      }
+      case 'FunctionDeclaration':
+      case 'ClassDeclaration':
+        // 严格模式下块级函数是块级作用域 ⇒ 只收顶层。
+        if (top && stmt.id?.name) out.add(stmt.id.name)
+        return
+      case 'BlockStatement':
+        walkStmts(stmt.body, false)
+        return
+      case 'IfStatement':
+        walkStmt(stmt.consequent, false)
+        if (stmt.alternate) walkStmt(stmt.alternate, false)
+        return
+      case 'ForStatement':
+        // `for (var i = 0; …)` 的 i 也是函数作用域（init 是表达式时 walkStmt 落到 default 直接返回）
+        if (stmt.init) walkStmt(stmt.init, false)
+        walkStmt(stmt.body, false)
+        return
+      case 'ForInStatement':
+      case 'ForOfStatement':
+        if (stmt.left?.type === 'VariableDeclaration') walkStmt(stmt.left, false)
+        walkStmt(stmt.body, false)
+        return
+      case 'WhileStatement':
+      case 'DoWhileStatement':
+      case 'LabeledStatement':
+      case 'WithStatement':
+        walkStmt(stmt.body, false)
+        return
+      case 'TryStatement':
+        walkStmt(stmt.block, false)
+        if (stmt.handler) walkStmt(stmt.handler.body, false)
+        if (stmt.finalizer) walkStmt(stmt.finalizer, false)
+        return
+      case 'SwitchStatement':
+        for (const c of stmt.cases ?? []) walkStmts(c.consequent, false)
+        return
+      default:
+        return
     }
   }
-  for (const stmt of body.body ?? []) {
-    if (stmt.type === 'VariableDeclaration') {
-      for (const d of stmt.declarations ?? []) addPattern(d.id)
-    } else if (stmt.type === 'FunctionDeclaration' && stmt.id?.name) {
-      out.add(stmt.id.name)
-    }
+
+  walkStmts(body.body, true)
+}
+
+/**
+ * inline 预变换后的 offset → 原始源码 offset。
+ *
+ * 偏移落在替换文本内部时只能映射到替换起点（无法精确还原），用于诊断/sourcemap
+ * 足够；替换区间边界映射到原区间端点。
+ */
+function mapInlineOffset(offset: number, edits: readonly InlineEdit[]): number {
+  if (!edits.length) return offset
+  let cum = 0
+  for (const e of edits) {
+    const tStart = e.start + cum
+    const tEnd = tStart + e.text.length
+    if (offset < tStart) break
+    if (offset < tEnd) return e.start
+    if (offset === tEnd) return e.end
+    cum += e.text.length - (e.end - e.start)
+  }
+  return offset - cum
+}
+
+/** 把最终产物里的 edit 描述整体映射回原始源码坐标。 */
+function mapEditToOriginal(edit: any, inlineEdits: readonly InlineEdit[]): any {
+  const map = (n: number) => mapInlineOffset(n, inlineEdits)
+  return {
+    ...edit,
+    comp: {
+      ...edit.comp,
+      start: map(edit.comp.start),
+      end: map(edit.comp.end),
+      bodyStart: map(edit.comp.bodyStart),
+      renderBodyStart: map(edit.comp.renderBodyStart),
+      renderBodyEnd: map(edit.comp.renderBodyEnd),
+    },
+    removals: edit.removals?.map((r: { start: number; end: number }) => ({ start: map(r.start), end: map(r.end) })),
+    ctor: edit.ctor ? { ...edit.ctor, pos: map(edit.ctor.pos) } : undefined,
   }
 }
 
@@ -93,12 +166,8 @@ export interface CompileResult {
     viewDeps: number
     /**
      * 约定错误（emit/@prop/@computed/@csscope 静态校验）。
-     *
-     * ⚠️ 这里**只有**约定错误。静态分析未通过的组件不会出现在 diagnostics 里 ——
-     * `assertStaticAnalysis` 直接抛 `StaticAnalysisError`，模板 codegen 失败同样抛。
-     * 不合规就报错，没有「凑合能跑」的产物，因此诊断里不需要任何结论字段。
      */
-    conventionErrors: Array<{ start: number; end: number; message: string }>
+    conventionErrors: Array<{ start: number; end: number; message: string; severity?: 'warn' }>
     /** 静态依赖清单（每组件无条件填充；options.verbose 时输出人类可读格式） */
     deps?: DepSummary
   }>
@@ -171,16 +240,7 @@ function makeVarMap(
 }
 
 /**
- * 默认的参与编译判定：`.ts` 且源码里出现 `extends CompElem` 或 `@tag`。
- *
- * 额外放行**家族装饰器**形态：mixin 文件（`export function mix(B) { class M extends B { @prop … } }`）
- * 既不含 `extends CompElem` 也不含 `@tag`（`@tag` 挂在具体组件上），但必须参与编译，
- * 否则其中的 `@prop/@state/@computed` 不会被剥离、注入的 `__ce_static__` 缺失，
- * 而运行时这几个装饰器是 no-op ⇒ 属性静默退化成普通实例字段。
- * 精确性由 `collectMixinClasses` 的「顶层函数体内 + 带 compelem 家族装饰器」把关，
- * 这里放宽只是让文件进入管线。
- *
- * ⚠️ 保持只收 `.ts`：IIFE 打包产物（`.js`）里指令名不在 scope，放宽会触发 D3 误报。
+ * 默认的参与编译判定：`.ts` 且源码里出现 `extends CompElem` 或 `@tag`
  */
 export function defaultInclude(id: string, code: string): boolean {
   const clean = id.split('?')[0]
@@ -189,6 +249,26 @@ export function defaultInclude(id: string, code: string): boolean {
   if (clean.includes('node_modules')) return false
   if (code.includes('extends CompElem') || /@tag\s*\(/.test(code)) return true
   return /@(prop|state|computed|query|queryAll)\b/.test(code)
+}
+
+/** 无 import 时插入 helper/carrier 的锚点：跳过 'use client' 等指令序言。 */
+function firstCodeStart(program: any): number {
+  const body = program?.body ?? []
+  let i = 0
+  while (i < body.length) {
+    const s = body[i]
+    const e = s?.expression
+    if (
+      s?.type === 'ExpressionStatement' &&
+      e?.type === 'Literal' &&
+      typeof e.value === 'string'
+    ) {
+      i++
+      continue
+    }
+    break
+  }
+  return body[i]?.start ?? 0
 }
 
 /** 构建组件依赖清单（4 处 diagnostics.push 统一入口）。 */
@@ -212,6 +292,13 @@ function buildDeps(
 }
 
 /** 根类别 → 展示标签。 */
+/** 模板方法内联预变换的快速门控：文件里没有 render( 就不必做预扫描 */
+const hRenderRe = /\brender\s*\(/
+
+// own 静态对象会遮蔽父类整个 __ce_static__；normal/noView 子类没有 own cssVars 时
+// 必须显式别名父类 cssEffect，否则继承来的 CSS 变量永远不会被写。
+const PARENT_CSS_EFFECT = 'Reflect.getPrototypeOf(this).__ce_static__?.cssEffect'
+
 const KIND_LABEL: Record<string, string> = {
   prop: 'prop',
   state: 'state',
@@ -260,7 +347,7 @@ function formatDeps(id: string, d: CompileResult['diagnostics'][number]): string
   return lines.join('\n')
 }
 
-/** 编译单个文件。不会抛出：解析失败时原样返回。 */
+/** 编译单个文件。解析失败时原样返回；静态分析/模板 codegen 失败会抛 StaticAnalysisError。 */
 export function compileFile(code: string, id: string, options: CompilerOptions = {}): CompileResult {
   const include = options.include ?? defaultInclude
   if (!include(id, code)) return { code, map: null, diagnostics: [], changed: false }
@@ -275,6 +362,22 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
     parsed = parse(code, id)
   } catch {
     return { code, map: null, diagnostics: [], changed: false }
+  }
+
+  // 模板方法内联预变换：`r => this.renderRow(r)` / `ifTrue(c, this.header())` 
+  const originalCode = code
+  let inlineEdits: InlineEdit[] = []
+  if (hRenderRe.test(code)) {
+    try {
+      const inlined = inlineTemplateMethodsWithEdits(code, parsed)
+      if (inlined.code !== code) {
+        inlineEdits = inlined.edits
+        code = inlined.code
+        parsed = parse(code, id)
+      }
+    } catch {
+      /* 预变换失败不阻断：交由主管线对原始源码给出原有诊断 */
+    }
   }
 
   const comps = analyzeFile(code, id, parsed)
@@ -313,8 +416,6 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
   const fileTags = new Set<string>()
   for (const c of comps) if (c.tagName) fileTags.add(c.tagName.toLowerCase())
   if (options.knownTags) for (const t of options.knownTags) fileTags.add(t.toLowerCase())
-  // 已知的 HTML 原生标签（非组件），供 .prop 目标校验时区分「原生标签误用」与「跨文件组件未知」
-  // 这里不穷举原生标签——校验逻辑是：有连字符但不在 knownTags → 错误；无连字符 → 原生标签错误；
 
   // 约定检查上下文（emit 校验 / @prop / @computed / @csscope 目标检查）
   const convCtx = {
@@ -330,7 +431,10 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
   // 改用 __ce_ 前缀别名（文件级统一，访问器与 import 注入共用）
   const moduleBindings = collectModuleBindings(parsed)
   const helperBindings: Record<string, string> = {}
-  for (const canon of RUNTIME_HELPERS) {
+  // compelem 的访问器 helper 与方法装饰器注入的 myfx helper 共用同一套
+  // “模块绑定冲突 → __ce_ 别名”机制。别名必须同时记录原始导出名，
+  // 注入 import 时生成 `signal as __ce_signal`，否则会 import 一个不存在的名字。
+  for (const canon of [...RUNTIME_HELPERS, ...MYFX_HELPERS]) {
     if (!moduleBindings.has(canon)) continue
     let alias = '__ce_' + canon
     let n = 1
@@ -403,12 +507,14 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       accessors: fieldRes.accessors || undefined,
     }
     // prop/state 初始值构造写入 + 访问器所需运行时函数（并集供文件级 import 注入）
-    // ⚠️ 构造体插入点条件：**fieldInits 或 methodDecoCtor 任一非空**就要算 ——
-    // 只有方法装饰器、没有 prop/state 的组件（如 `@onced init(){}` 裸组件）同样必须注入。
     const needCtor = fieldRes.fieldInits.length > 0 || !!mdRes.ctorStmts
     const ctorPlan = needCtor
       ? planCtorInsert(comp, comp.cls ?? convCtx.localClasses.get(comp.className), code)
       : undefined
+    // super 在分支/嵌套结构内 → 初始值写入退到构造体末尾，走 W 通道提示时序取舍
+    if (ctorPlan?.warn) {
+      conventionErrors.push({ start: comp.start, end: comp.end, message: ctorPlan.warn, severity: 'warn' })
+    }
     const fieldHelpers = fieldRes.runtimeHelpers.map((n) => helperBindings[n] ?? n)
     const fieldExtras = {
       fieldInits: fieldRes.fieldInits.length ? fieldRes.fieldInits : undefined,
@@ -441,9 +547,11 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
 
     // ---- cssDeps / computedDeps 静态提取（候选4/候选3，无视图也尝试）----
     const cssDeps = extractCssDeps(comp, convCtx.localClasses)
-    const computedDeps = extractComputedDeps(comp, convCtx.localClasses)
+    // computedDeps 只进 verbose 依赖清单；默认不算（避免每个 getter 一次 alias fixpoint）。
+    const computedDeps = depsDisplay ? extractComputedDeps(comp, convCtx.localClasses) : undefined
     let cssEffectCode: string | undefined
-    if (cssDeps && cssDeps.length) {
+    // 空依赖也要生成 effect：cssVars 可能只返回常量，首轮仍需 wCssVars 落盘。
+    if (cssDeps !== undefined && comp.cssVarsBody && comp.cssVarsBody.length) {
       /**
        * `__s` **只按信号根键存放**（`CompElem.ts` `#slotsSig()` / 各 `__s[key]` 访问），
        * 故这里必须做两件事：
@@ -469,31 +577,12 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
     } else if (cssDeps === undefined && comp.cssVarsBody && comp.cssVarsBody.length) {
       /**
        * ⚠️ **依赖提取失败 ⇒ 「全根兜底」，而不是「什么都不生成」。**
-       *
-       * `extractCssDeps` 返回 `undefined` 的三种现实来源（都是**静态不可知**，不是作者写错）：
-       *   1. 链根是**跨文件基类**成员 —— 依赖链分级只认「本文件内的类」，跨文件 → `cross-file`
-       *      （`Portal` / `PortalEditor` 的 `gap` 来自 `ParentPortal`）；
-       *   2. `get cssVars()` 里出现 `super`，如 `assign(super.cssVars, {…})`（`Editable`）；
-       *   3. 引用了非响应式宿主（`this.slots.subheading` → `unknown-root`，`ListItem`）。
-       *
-       * 历史实现让整段 `cssEffect` **不生成**，而 `wCssVars()` 在框架里**唯一**的调用点就是
-       * 生成的 `cssEffect` ⇒ 宿主上一个 `--x` 变量都不会被写（不是某一项失效，是**全灭**），
-       * 且**没有任何运行时兜底**。这正是 `deps-extract.ts` 文件头承诺的「运行时全根兜底」
-       * 长期缺失的那一半。
-       *
-       * 兜底策略：effect 每轮**动态遍历本组件 `__s` 上的全部信号**并读取它们的值。
-       *  - 全部成为依赖 ⇒ 任何自身信号变化都会重跑 `wCssVars`（含跨文件基类创建的信号，
-       *    因为它们同样落在同一个 `this.__s` 上）—— 这才是「全根」的字面含义；
-       *  - `for (const k of Object.keys(s))` + `if (c)` 守卫：`__s.slots` 在 destroy 阶段
-       *    会被置 `null`（`CompElem.ts:334`），不能无条件 `.value`；
-       *  - 读取用 `nv.push(c.value)` 而非字符串化的依赖数组：运行时 key 集不可静态化，
-       *    只能按**当轮实际存在**的信号集合比较。`wCssVars` 自带旧值镜像去重，
-       *    重复调用只做几次属性写读，成本可忽略。
+
        */
       writers.add('wCssVars')
       cssEffectCode =
-        `(rc) => { let ov; return () => { const s = rc.__s; const nv = []; ` +
-        `for (const k of Object.keys(s)) { const c = s[k]; if (c) nv.push(c.value) } ` +
+        `(rc) => { let ov, ks; return () => { const s = rc.__s; if (!ks) ks = Object.keys(s); const nv = []; ` +
+        `for (let i = 0; i < ks.length; i++) { const c = s[ks[i]]; if (c) nv.push(c.value) } ` +
         `let changed = ov === undefined || nv.length !== ov.length; ` +
         `if (!changed) { for (let i = 0; i < nv.length; i++) { if (!Object.is(nv[i], ov[i])) { changed = true; break } } } ` +
         `if (changed) { wCssVars(rc); ov = nv } } }`
@@ -505,23 +594,11 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
 
     // ---- 无视图组件（noView）：无 render / render 返回 null / 继承链终点 CompElem ----
     if (comp.noView) {
-      // ⚠️ `cssEffect` 必须一并带出去。noView 只是「没有 render 模板」，与「有没有
-      // cssVars」无关 —— `ce-row` 这类纯布局容器正是靠 `hostCss + CSS 变量` 工作的：
-      // 它的 `gridColGap` 只能经 `cssVars` 写到宿主，丢了 cssEffect 就等于整套栅格
-      // 间距失效（`--grid-col-gap` 从未被写）。历史上这里只传 `{...fieldCodes}`，
-      // 而 cssEffect 是在**这段之后**由模板 codegen 分支消费的，于是 noView 组件
-      // 的 cssVars 被整体静默丢弃（2026-10-09 实测于 `Row.ts`：cssDeps=['gap'] 正常
-      // 提取，产物里却无 cssEffect）。
-      // ⚠️ 同样，`watchEffects` 必须一并带出。`@watch` 是编译期生成 effect 工厂、
-      // 运行期由 `setupViewIndependentEffects` 调度的——与「有没有 render 模板」无关。
-      // 漏传则 noView 组件的 `immediate` watch 永不执行（如 `ce-aside` 的 `width`
-      // 永远设不上）。`buildStaticLiteral` 内部 `if (codes.watchEffects)` 才注入，
-      // 无 watcher 时传 `undefined` 完全安全。
       edits.push({
         comp,
         literal: buildStaticLiteral({ noView: true }, {
           ...fieldCodes,
-          cssEffect: cssEffectCode,
+          cssEffect: cssEffectCode ?? PARENT_CSS_EFFECT,
           watchEffects: watchEffectsCode,
           inlinedWatchAncestors: watchRes.inlinedAncestors,
         }),
@@ -547,7 +624,9 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
         !!fieldRes.accessors ||
         fieldRes.propsCode !== undefined ||
         fieldRes.statesCode !== undefined ||
-        fieldRes.computedCode !== undefined
+        fieldRes.computedCode !== undefined ||
+        // 只有 cssVars 覆写、没有其他家族成员的中间类也必须注入自己的 cssEffect
+        !!cssEffectCode
       if (hasOwnField || watchEffectsCode) {
         // super 表达式改由 emitFamily 内部的 `Reflect.getPrototypeOf(this)` 解析：
         // 原先 `code.slice(superNode.start, superNode.end)` 重放 extends 子句源码，
@@ -565,19 +644,6 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
         if (watchEffectsCode) {
           parts.push(mk('watchEffects', `watchEffects: ${emitWatchEffects(watchEffectsCode, watchRes.inlinedAncestors)}`))
         }
-        /**
-         * ⚠️ 本类**自己**声明了 `get cssVars()` 时必须注入自己的 cssEffect。
-         *
-         * skipInjection 走「视图字段整体 spread 继承祖先 `__ce_static__`」，其中包含祖先的
-         * `cssEffect` —— 但祖先那份的依赖集是按**祖先的 cssVars 体**静态提取的，对子类的
-         * 覆写体完全不对：子类独有的变量在祖先依赖变化时不会刷新，甚至（依赖提取失败时）
-         * 祖先根本没有 cssEffect。典型：`ce-editable extends Table` 的
-         * `assign(super.cssVars, { '--editable-row-indicator-width': … })`。
-         *
-         * 注入 own `cssEffect` 会在原型链上**遮蔽**祖先那份（own 键优先），这是期望行为：
-         * 子类体若静态不可知，编译器已退化为「全根兜底」（遍历 `__s` 全部信号），
-         * 覆盖范围是祖先依赖的超集。
-         */
         if (cssEffectCode) parts.push(mk('cssEffect', `cssEffect: ${cssEffectCode}`))
         // 本分支（继承链上有 render 祖先 ⇒ skipInjection）与 `codegen/inject.ts` 同为
         // 注入路径，产物里同样只留运行时需要的东西。
@@ -599,10 +665,6 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
     }
 
     // ---- 模板诊断（约定错误 E-*）无条件执行 ----
-    // extractMainTemplate → parseTemplateTree → checkTemplateRules 始终运行，
-    // 与静态分析结论正交，必须报告。
-    // codegen（generateBuildTemplate/generateBuildVars）条件化：noView / skipInjection
-    // 分支各自提前返回，正常路径才生成构建产物。
     let buildTemplateCode: string | undefined
     let subsCode: string | undefined
     let pointEffectsCode: string | undefined
@@ -620,6 +682,8 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
           buildTemplateHTML(mainTmpl.strings),
           mainTmpl.vars.length,
         )
+        // 折叠只对文本位生效；属性名/属性值里的 html(CONST) 必须保留指令语义。
+        clearAttrFragments(tree.root, mainTmpl.vars)
         // 模板层约定规则（.prop 须插值 / 事件须函数 / ref 须 createRef / 指令位置 / .prop 目标）
         conventionErrors.push(...checkTemplateRules(tree, mainTmpl, comp, convCtx, fileTags))
 
@@ -649,9 +713,22 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
             const freeCache: Map<string, Set<string> | null> = new Map()
             try {
               subCandidates = collectSubCandidates(comp, code)
+              // 每个候选只解析一次树：既用于清理属性位的 fragment 标记（必须早于
+              // generateSubBuildVars），也供后续 buildTemplate codegen 复用。
+              for (const cand of subCandidates) {
+                cand.tree = parseTemplateTree(
+                  buildTemplateHTML(cand.strings),
+                  cand.vars.length,
+                )
+                clearAttrFragments(cand.tree.root, cand.vars)
+                // 子模板里的指令实参（forEach keyFn / model 写回路径）同样要校验：
+                // 这些规则只看表达式本身，不依赖插入位置映射，可直接按 vars 走。
+                conventionErrors.push(...checkDirectiveArgs(cand.vars, convCtx))
+              }
             } catch (e) {
               tmplErrors = [
                 e instanceof SubExtractError || e instanceof TemplateExtractError
+                  || e instanceof TemplateParseError
                   ? e.message
                   : String(e),
               ]
@@ -673,50 +750,11 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                 }
                 /**
                  * 候选「需要祖先作用域的标识符」= 自身 freeIds ∪ **所有后代候选**的 needIds。
-                 *
-                 * ⚠️ 只看自身 freeIds 是不够的：后代候选会被内联进**本候选的工厂体**，而
-                 * 本候选若留在模块级（carrier 常量 / 顶层 `subViews` 条目），这条**词法链
-                 * 就断了** —— 后代挂在 `__fx` 上的工厂会引用一个在类级对象字面量里根本不存在
-                 * 的名字。
-                 *
-                 * 实测（2026-10-09，compelem-ui `Select.ts:233`）：
-                 * ```ts
-                 * ${slot((v, i, onClose) => h`${ifElse(
-                 *   !!this.slotHooks.tag && this.tags,
-                 *   () => h`${html(this.customTagHTML(v))}`,
-                 *   () => h`${ifElse(                                  // ← C：自身不引用 v/onClose
-                 *     !!this.tags,
-                 *     () => h`<ce-tag closable @close="${onClose}">${v}</ce-tag>`,  // ← D
-                 *     () => h`${v}`                                     // ← E
-                 *   )}`
-                 * )}`)}
-                 * ```
-                 * C 的自身 freeIds 为空 ⇒ 旧判据把它当「自洽子模板」，发成**类级**
-                 * `subViews.4`（带 pointEffects）。而 D/E 的 freeIds ⊆ A 的形参 ⇒ 被提升为
-                 * `__fx` 内联进 **C 的工厂体**。结果产物里出现
-                 * `subViews.4.pointEffects = (rc, nodes, __ceGet, __ceDep, ov) => () => { const a0 = v; … }`
-                 * —— 类级作用域没有 `v` ⇒ 运行期 `ReferenceError: v is not defined`
-                 * （堆栈 `registerSubViewEffects → effect.asChild`）。
-                 *
-                 * 修法：把后代的需求**上推**。C 因此也进入 liftPlan，被发成挂在 A 工厂体内
-                 * 载体上的 `__fx` —— 与 B 同一条路径，靠**词法闭包**捕获 A 的形参，
-                 * 自身签名无需声明形参（运行期给嵌套 `__fx` 的 itemArgs 本就与闭包无关）。
                  */
                 const needCache = new Map<number, Set<string>>()
                 /**
                  * `needIds(cand)` = **cand 的工厂被发出去之后，它的工厂体（含所有被内联进来的
-                 * 后代 `__fx`）还需要从「cand 工厂之外」拿到哪些标识符**。
-                 *
-                 *   needIds(c) = ownFreeIds(c)
-                 *              ∪ ⋃_{后代 d} ( needIds(d) − params(d) )     ← d 的工厂词法嵌在 c 体内，
-                 *                                                            d 自己声明的形参由其自身满足
-                 *              − params(c)                                  ← c 自身的形参同理
-                 *
-                 * ⚠️ **必须逐层减去后代自身形参**。反例（DatePicker 实测）：3 层 forEach
-                 * `(date, i) → row → col`，若直接把后代 freeIds 并上来，sub#2 的 need 会
-                 * 变成 `[date, row]` —— 而 `row` 正是 sub#2 自己的形参，`row ∉ allowed`
-                 * （allowed 只含祖先形参 date/i）⇒ sub#2 被判「不可提升」，留在模块级，
-                 * 其 `date` 引用随即落空。正确结果应是 `need(sub#2) = [date]` ⇒ 可提升。
+                 * 后代 `__fx`）还需要从「cand 工厂之外」拿到哪些标识符**
                  */
                 /** cand 的**直接子候选**：被 cand 严格内含、且不被 cand 的其它后代再内含 */
                 const directChildrenOf = (cand: (typeof subCandidates)[number]) => {
@@ -735,10 +773,6 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                   if (hit) return hit
                   needCache.set(cand.subId, new Set()) // 防环占位
                   const out = new Set<string>(subBvMap.get(cand.subId)?.freeIds ?? [])
-                  // ⚠️ 只收**直接子候选**。遍历全部后代会把孙子层已经由「中间层形参」满足的
-                  // 名字重复上推（DatePicker 实测：sub#1 因此多出 `row`，而 `row` 由 sub#2 形参
-                  // 绑定）。重复上推的方向是**保守**的（只会少提升、不会生成非法引用），
-                  // 但它会让本可内联的候选白白退回模块级载体。
                   for (const o of directChildrenOf(cand)) {
                     for (const id of needIdsOf(o)) out.add(id)
                   }
@@ -751,7 +785,15 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                   const need = needIdsOf(cand)
                   const ancestors = enclosingCandidates(cand, subCandidates)
                   const allowed = new Set<string>()
-                  for (const a of ancestors) for (const n of paramBaseNames(a.params)) allowed.add(n)
+                  for (const a of ancestors) {
+                    for (const n of paramBaseNames(a.params)) allowed.add(n)
+                    // 祖先 prelude 声明的局部 const 同样在祖先工厂体作用域内：
+                    // 提升后的 __fx 工厂词法嵌在祖先 pe/fx 体里，祖先 prelude 会按
+                    // usesPrelude 文本判定注入工厂体开头 ⇒ 闭包捕获安全。
+                    // 这是 inline-template-methods「prelude 注入」设计的前提——
+                    // 调用形态的实参绑定就是祖先 prelude const（2026-10-14）。
+                    if (a.preludeSrc) collectPreludeDeclNames(a.preludeSrc, allowed)
+                  }
                   if (!need.size) continue
                   if (![...need].every((id) => allowed.has(id))) continue
                   liftPlan.push({ cand, allowed, r })
@@ -787,11 +829,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                     // 自由标识符校验仍由上面的 generateSubBuildVars(extraAllowed) 负责。
                     let liftGen: ReturnType<typeof generateBuildTemplate> | undefined
                     try {
-                      const liftTree = parseTemplateTree(
-                        buildTemplateHTML(cand.strings),
-                        cand.vars.length,
-                      )
-                      liftGen = generateBuildTemplate(liftTree.root, cand.vars, {
+                      liftGen = generateBuildTemplate(cand.tree!.root, cand.vars, {
                         className: comp.className,
                         knownTags: fileTags,
                       })
@@ -848,14 +886,23 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
               if (bv.code) {
                 // `bv.code` 本身不注入产物：主模板的每个点都已把表达式内联进
                 // fx / pointEffects 工厂。保留本函数调用是因为它还提供两样东西：
-                //   ① `bv.errors` —— 门禁（自由标识符 / TS 语法 ⇒ 不可编译）
-                //   ② `bv.viewDepVarIndices` —— verbose 依赖清单的根名→var 映射
+                //   1 `bv.errors` —— 门禁（自由标识符 / TS 语法 ⇒ 不可编译）
+                //   2 `bv.viewDepVarIndices` —— verbose 依赖清单的根名→var 映射
                 if (mainUps?.length) {
                   // varIndex → 该 var 自己的表达式：保留 `this.metrics.length` 这类成员访问，
                   // 否则 effect 只会读 `rc.__s.metrics.value`（整个数组），
                   // 文本点就会渲染成 [object Object],[object Object],…
+                  const upsVars = varsByUpIndex(mainTmpl.vars)
+                  // 自守卫：每个非片段 var 恰好产生一个 up（serializeUp 的同一不变量）。
+                  // 一旦被打破，宁可构建期硬报错，也不静默解错表达式。
+                  if (upsVars.length !== mainUps.length) {
+                    tmplErrors = [
+                      `插值槽与更新点数量不一致（插值 ${upsVars.length} / 更新点 ${mainUps.length}）：` +
+                      `varIndex 空间错位，拒绝生成取值表达式`,
+                    ]
+                  }
                   const varIndexToExpr = new Map<number, string>()
-                  for (const v of mainTmpl.vars) varIndexToExpr.set(v.index, v.exprSource)
+                  for (let vi = 0; vi < upsVars.length; vi++) varIndexToExpr.set(vi, upsVars[vi].exprSource)
                   // `__s` 的真实键集 = 本组件（含继承链）已建信号的字段 + 框架自带 slots。
                   // 只有这些键才允许内联成 `rc.__s.<k>.value`，见 signalExprFor 的说明。
                   const signalKeys = new Set<string>(comp.fields.keys())
@@ -863,9 +910,10 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                   // 内联上下文：让 effect / fx 工厂直接内联表达式（含 __subId wraps）。
                   // - ranges：varIndex → 源码绝对区间，applySubIdWraps 靠偏移切片
                   const varIndexToRange = new Map<number, [number, number]>()
-                  for (const v of mainTmpl.vars) {
+                  for (let vi = 0; vi < upsVars.length; vi++) {
+                    const v = upsVars[vi]
                     if (typeof v.start === 'number' && typeof v.end === 'number') {
-                      varIndexToRange.set(v.index, [v.start, v.end])
+                      varIndexToRange.set(vi, [v.start, v.end])
                     }
                   }
                   // 主模板 prelude：stripTs → TS 复检 → rewriteThis('rc')。
@@ -875,11 +923,11 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                   let fxPrelude = ''
                   const preludeNames = new Set<string>()
                   if (mainTmpl.preludeSrc) {
-                    let pl = stripTs(mainTmpl.preludeSrc)
-                    if (TS_SYNTAX_RE.test(pl)) {
+                    const pc = stripTsChecked(mainTmpl.preludeSrc)
+                    if (pc.tsHit) {
                       tmplErrors = ['render() prelude 含 TS 专有语法（as/satisfies/非空断言），放弃注入']
                     } else {
-                      pl = rewriteThis(pl, 'rc') ?? ''
+                      const pl = rewriteThis(pc.stripped, 'rc') ?? ''
                       fxPrelude = pl
                       collectPreludeDeclNames(mainTmpl.preludeSrc, preludeNames)
                     }
@@ -912,7 +960,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                   }
 
                 }
-                const vm = makeVarMap(comp, bv.viewDepVarIndices, mainUps, mainNodeNames)
+                const vm = depsDisplay ? makeVarMap(comp, bv.viewDepVarIndices, mainUps, mainNodeNames) : undefined
                 if (vm) updateMeta.varMap = vm
               } else {
                 buildTemplateCode = undefined
@@ -930,11 +978,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
               const entries: string[] = []
               for (const cand of subCandidates) {
                 try {
-                  const subTree = parseTemplateTree(
-                    buildTemplateHTML(cand.strings),
-                    cand.vars.length,
-                  )
-                  const subGen = generateBuildTemplate(subTree.root, cand.vars, {
+                  const subGen = generateBuildTemplate(cand.tree!.root, cand.vars, {
                     className: comp.className,
                     knownTags: fileTags,
                   })
@@ -946,7 +990,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                     c1SubBvMap?.get(cand.subId) ??
                     generateSubBuildVars(cand, code, comp, subCandidates, c1BvOpts)
 
-                  const subVm = makeVarMap(comp, subBv.viewDepVarIndices, subGen.ups, subGen.nodeNames)
+                  const subVm = depsDisplay ? makeVarMap(comp, subBv.viewDepVarIndices, subGen.ups, subGen.nodeNames) : undefined
                   if (subVm) {
                     if (!updateMeta.subVarMap) updateMeta.subVarMap = {}
                     updateMeta.subVarMap[cand.subId] = subVm
@@ -986,11 +1030,17 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                     // 取值表达式无法内联进 effect 工厂（自由标识符既不在自身形参、
                     // 也不在任何祖先回调形参里）→ **构建期报错**：静态路径不执行
                     // render()，闭包作用域未必存在这些名字。
-                    tmplErrors = [
-                      `sub#${cand.subId}: 插值表达式无法内联进 effect 工厂，引用了无法解析的自由标识符 '${(subBv.freeIds ?? []).join(
-                        "', '",
-                      )}'`,
-                    ]
+                    // freeIds 为空说明失败来自其他 code:null 路径（如私有名包装
+                    // parse 失败），此时 subBv.errors 才是真实原因，优先透出。
+                    const realErrors =
+                      (subBv.errors?.length ?? 0) > 0 && !(subBv.freeIds?.length ?? 0)
+                        ? subBv.errors
+                        : [
+                          `插值表达式无法内联进 effect 工厂，引用了无法解析的自由标识符 '${(subBv.freeIds ?? []).join(
+                            "', '",
+                          )}'`,
+                        ]
+                    tmplErrors = realErrors.map((m) => `sub#${cand.subId}: ${m}`)
                     break
                   }
                 } catch (e) {
@@ -1008,7 +1058,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
               } else if (entries.length) {
                 subsCode = `{ ${entries.join(', ')} }`
                 // subViewDeps：start → subId 映射后进入依赖清单
-                if (ra.subViewDeps.size) {
+                if (depsDisplay && ra.subViewDeps.size) {
                   const startToSubId = new Map(subCandidates.map((c) => [c.start, c.subId]))
                   const rec: Record<number, string[]> = {}
                   let hasAny = false
@@ -1048,23 +1098,20 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       const allNull =
         topRets.length > 0 &&
         topRets.every((r: any) => {
-          const arg = r.argument
-          if (!arg) return true // return; （无值）视为 null
+          const raw = r.argument
+          if (!raw) return true // return; （无值）视为 null
+          const arg = unwrapExpr(raw)
           if (arg.type === 'Literal' && (arg.value === null || arg.value === undefined)) return true
           if (arg.type === 'Identifier' && (arg.name === 'null' || arg.name === 'undefined')) return true
           if (arg.type === 'UnaryExpression' && arg.operator === 'void') return true
           return false
         })
       if (allNull) {
-        // ⚠️ 与上面那条 noView 分支同规格：`watchEffects` / `cssEffect` 必须一并带出。
-        // 历史上这里只传 `{...fieldCodes}`，而 @watch 装饰器已被 watchRemovals 删除 ——
-        // 产物里既无装饰器也无 watchEffects，该组件（及其基类）的 watch **全部静默失效**，
-        // 且不产生任何诊断（基类在本文件外时 E-WATCH-SOURCE 校验同样跳过）。
         edits.push({
           comp,
           literal: buildStaticLiteral({ noView: true }, {
             ...fieldCodes,
-            cssEffect: cssEffectCode,
+            cssEffect: cssEffectCode ?? PARENT_CSS_EFFECT,
             watchEffects: watchEffectsCode,
             inlinedWatchAncestors: watchRes.inlinedAncestors,
           }),
@@ -1081,13 +1128,18 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       }
     }
 
+    // render() 存在但没有可编译的主模板（返回 this.tpl / h(CONST) / 其它非 h 表达式）
+    // ⇒ 产物既无 buildTemplate 也无 noView，运行时 setup 会抛“未编译”。构建期直接拦。
+    if (comp.hasRender && (!mainTmpl || !buildTemplateCode)) {
+      throw new StaticAnalysisError(comp.className, [
+        'render() 必须返回唯一的 h`` 模板或 null/undefined；' +
+        '返回普通表达式/预计算 Template 无法生成静态视图。',
+      ])
+    }
+
     // 静态路径准入（运行时唯一渲染路径 = buildTemplate 在字面量里）
     // → render() 成死代码：体清空为 `render(): Template {}`（走 removals，剥离测试恒等）。
-    // 「未准入」只剩 noView 一种，走上面 noView 的早退分支，不会流到这里。
-    //
-    // ⚠️ 判据就是「静态路径产出了 buildTemplate」。
-    //    也**不能用 pointEffectsCode 代替** —— 无 view 点的组件它为 undefined，
-    //    会让本该走静态路径的组件忽然保留 render 体（会导致 subs 的 __subId 丢失）。
+    // 「未准入」只剩 noView 一种，走上面 noView 的早退分支，不会流到这里
     const stripRender =
       !!buildTemplateCode &&
       comp.renderBodyStart >= 0 &&
@@ -1099,7 +1151,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
         fx: fxCode,
         watchEffects: watchEffectsCode,
         inlinedWatchAncestors: watchRes.inlinedAncestors,
-        cssEffect: cssEffectCode,
+        cssEffect: cssEffectCode ?? PARENT_CSS_EFFECT,
         buildTemplate: buildTemplateCode,
         subViews: subsCode,
         ...fieldCodes,
@@ -1121,11 +1173,17 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
   for (const rs of renderStrips) rs.edit.removals = [...(rs.edit.removals ?? []), { start: rs.start, end: rs.end }]
 
   // 访问器所需运行时函数：文件级并集 → 扩展已有 compelem import（或新增独立 import 行）
-  const helperNeeds = new Set<string>()
-  const myfxNeeds = new Set<string>()
+  // Map<本地名, 原始导出名>：冲突别名时两者不同，import 必须写 `原导出名 as 本地名`。
+  const localToImported = new Map<string, string>()
+  for (const [canon, alias] of Object.entries(helperBindings)) localToImported.set(alias, canon)
+  const helperNeeds = new Map<string, string>()
+  const myfxNeeds = new Map<string, string>()
+  const addNeed = (into: Map<string, string>, local: string) => {
+    into.set(local, localToImported.get(local) ?? local)
+  }
   for (const e of edits) {
-    for (const hlp of e.helpers ?? []) helperNeeds.add(hlp)
-    for (const hlp of e.myfxHelpers ?? []) myfxNeeds.add(hlp)
+    for (const hlp of e.helpers ?? []) addNeed(helperNeeds, hlp)
+    for (const hlp of e.myfxHelpers ?? []) addNeed(myfxNeeds, hlp)
   }
   let helperImport: { decl: any; source: string } | undefined
   let myfxImport: { decl: any; source: string } | undefined
@@ -1136,13 +1194,19 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       if (helpersAnchor === undefined) helpersAnchor = node.start
       const src = node.source?.value
       if (typeof src === 'string') {
-        if (!helperImport && isCompelemSource(src)) helperImport = { decl: node, source: src }
-        else if (!myfxImport && isMyfxSource(src)) myfxImport = { decl: node, source: src }
+        if (isCompelemSource(src)) {
+          // C4：同文件多处命中 compelem 源时，优先裸包名 `compelem`（生产形态），
+          // dev 相对形态 `./src` 仅作回退——避免 dev 依赖把 helper 注到相对入口上。
+          if (!helperImport || (helperImport.source !== 'compelem' && src === 'compelem')) {
+            helperImport = { decl: node, source: src }
+          }
+        } else if (!myfxImport && isMyfxSource(src)) {
+          myfxImport = { decl: node, source: src }
+        }
       }
-      if (helperImport && myfxImport) break
     }
     // 无 import 时锚在首语句起点（前导注释之后）
-    if (helpersAnchor === undefined) helpersAnchor = parsed.program.body?.[0]?.start ?? 0
+    if (helpersAnchor === undefined) helpersAnchor = firstCodeStart(parsed.program)
   }
 
   // carrier 常量的模块级插入点：最后一个 import 声明之后（无 import 则首语句之前）
@@ -1152,19 +1216,56 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
     for (const node of parsed.program.body ?? []) {
       if (node.type === 'ImportDeclaration') lastImportEnd = node.end
     }
-    topLevelAnchor =
-      lastImportEnd ?? parsed.program.body?.[0]?.start ?? 0
+    topLevelAnchor = lastImportEnd ?? firstCodeStart(parsed.program)
   }
 
-  const { code: out, map, injected, additions } = injectInto(code, edits, id, {
-    helpers: helperNeeds.size ? [...helperNeeds] : undefined,
-    helperImport,
-    myfxHelpers: myfxNeeds.size ? [...myfxNeeds] : undefined,
-    myfxImport,
-    helpersAnchor,
-    topLevel: carrierDecls.length ? carrierDecls.join('\n') : undefined,
-    topLevelAnchor,
-  })
+  const aliasRecord = (m: Map<string, string>) =>
+    Object.fromEntries([...m].filter(([local, imported]) => local !== imported))
+
+  const mappedEdits = inlineEdits.length ? edits.map((e) => mapEditToOriginal(e, inlineEdits)) : edits
+  const mapPos = (n: number | undefined) =>
+    n === undefined ? undefined : mapInlineOffset(n, inlineEdits)
+  const mapImport = (
+    imp: { decl: any; source: string } | undefined,
+  ): { decl: any; source: string } | undefined =>
+    !imp || !inlineEdits.length
+      ? imp
+      : {
+        source: imp.source,
+        decl: {
+          ...imp.decl,
+          start: mapInlineOffset(imp.decl.start, inlineEdits),
+          end: mapInlineOffset(imp.decl.end, inlineEdits),
+        },
+      }
+
+  const { code: out, map, injected, additions } = injectInto(
+    inlineEdits.length ? originalCode : code,
+    mappedEdits,
+    id,
+    {
+      helpers: helperNeeds.size ? [...helperNeeds.keys()] : undefined,
+      helperAliases: helperNeeds.size ? aliasRecord(helperNeeds) : undefined,
+      helperImport: mapImport(helperImport),
+      myfxHelpers: myfxNeeds.size ? [...myfxNeeds.keys()] : undefined,
+      myfxAliases: myfxNeeds.size ? aliasRecord(myfxNeeds) : undefined,
+      myfxImport: mapImport(myfxImport),
+      helpersAnchor: mapPos(helpersAnchor),
+      topLevel: carrierDecls.length ? carrierDecls.join('\n') : undefined,
+      topLevelAnchor: mapPos(topLevelAnchor),
+      inlineEdits,
+    },
+  )
+
+  // 诊断的 offset 是 inline 变换后的坐标系；对外统一回到原始源码坐标。
+  if (inlineEdits.length) {
+    for (const d of diagnostics) {
+      for (const e of d.conventionErrors) {
+        e.start = mapInlineOffset(e.start, inlineEdits)
+        e.end = mapInlineOffset(e.end, inlineEdits)
+      }
+    }
+  }
   // verbose 依赖清单打印（depsDisplay 判定同上，已在 compileFile 入口计算）
   if (depsDisplay) {
     for (const d of diagnostics) if (d.deps) console.log(formatDeps(id, d))
@@ -1174,7 +1275,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
     map,
     diagnostics,
     changed: injected.length > 0,
-    removals: edits.flatMap((e) => e.removals ?? []),
+    removals: mappedEdits.flatMap((e) => e.removals ?? []),
     additions,
   }
 }

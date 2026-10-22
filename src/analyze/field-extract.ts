@@ -30,11 +30,21 @@
  */
 import type { ComponentAnalysis } from '../types'
 import { DEBUG_DIV } from '../types'
-import { keyName } from '../utils/oxc'
+import { keyName, IDENT_RE } from '../utils/ast'
 import { superClassName } from './component'
-import { decoratorName, unwrapTsExpr, type ConventionError, type ConventionsContext } from './conventions'
+import {
+  decoratorName,
+  finalOption,
+  flattenOptionProps,
+  hasOpaqueOption,
+  unwrapTsExpr,
+  type ConventionError,
+  type ConventionsContext,
+  type OptionEntry,
+} from './conventions'
 import { inferInitMeta } from './literal-meta'
 import { lineSpan, resolveSources } from './watch-extract'
+import { stripLineComments } from '../utils/js-text'
 
 export interface FieldExtractResult {
   /** 需从源码删除的 span（prop/state/computed/query 整个成员），已做整行清理 */
@@ -65,13 +75,42 @@ type Family = 'prop' | 'state' | 'computed' | 'query'
 /** 访问器生成所需的模块级运行时函数（编译注入 compelem import）。 */
 export const RUNTIME_HELPERS = ['signal', 'signalComputed', 'writeModelProp', '_queryGet', '_observedAttrs'] as const
 
-const IDENT_RE = /^[A-Za-z_$][\w$]*$/
-
 const FAM_CODE: Record<Family, string> = {
   prop: 'E-PROP-ARG',
   state: 'E-STATE-ARG',
   computed: 'E-COMPUTED-ARG',
   query: 'E-QUERY-ARG',
+}
+
+/**
+ * `@prop` / `@state` 选项的**唯一**合法键集合，逐字对齐运行期类型声明：
+ *   - StateOption → compelem/src/types.ts:108-120
+ *   - PropOption  → compelem/src/types.ts:130-172（`_defaultValue` / `_typeAry` 是内部字段，不对外）
+ *
+ * 选项对象会被原样搬进 `__ce_static__.props/states`，运行期只按上述类型的字段取值，
+ * 表外的键**没有任何消费点**（写进去既不报错也不生效）。故这里做闭集校验：
+ * 表外键一律编译期拒绝，而不是逐个写特例（`type`/`defaultValue`/`prop` …）——
+ * 后者漏掉一个键就静默放行，且文案还得跟着类型演进而改。
+ */
+const PROP_OPTION_KEYS: ReadonlySet<string> = new Set([
+  'shallow', 'type', 'required', 'model', 'attribute', 'hasChanged', 'converter', 'isValid',
+])
+const STATE_OPTION_KEYS: ReadonlySet<string> = new Set(['shallow', 'hasChanged'])
+
+/**
+ * 收集 options 里不在 `allowed` 内的键名（去重，保持书写顺序）。
+ *
+ * opaque 条目（无法静态展开的 spread）不下结论——展开内容不可知时宁漏勿误报；
+ * 显式写出的键则必判，因为 spread 只会覆盖值、删不掉这个键。
+ */
+function unsupportedOptionKeys(seq: OptionEntry[], allowed: ReadonlySet<string>): string[] {
+  const out: string[] = []
+  for (const e of seq) {
+    if (e.kind !== 'prop') continue
+    const k = keyName(e.node.key)
+    if (k && !allowed.has(k) && !out.includes(k)) out.push(k)
+  }
+  return out
 }
 
 /**
@@ -209,6 +248,15 @@ export function extractFieldAccessors(
     dec: any
     /** query 族区分 query / queryAll */
     decLocal: string
+    /**
+     * query 族第一遍已解析的 selector / cache 实参（第二遍直接复用）。
+     *
+     * 两遍用的是**同一批 AST 节点 + 同一份 ctx**（`dec` 存的就是 `nodes[0]`，
+     * resolveSources 只读 ctx.stringConsts、不改动任何状态），结果必然相同，
+     * 没必要再解析一次。
+     */
+    selector?: string
+    cacheStrs?: string[] | null
   }
   const cands: Cand[] = []
   const failed = new Set<Family>()
@@ -268,6 +316,8 @@ export function extractFieldAccessors(
     const family = famDecs.keys().next().value as Family
     const nodes = famDecs.get(family)!
     const decLocal = decoratorName(nodes[0])!
+    let selector: string | undefined
+    let cacheStrs: string[] | null | undefined
     if (nodes.length !== 1) {
       failMember(family, member, `${FAM_CODE[family]}: 成员 '${shownName}' 重复挂载 @${decLocal}`)
       continue
@@ -347,9 +397,10 @@ export function extractFieldAccessors(
         failMember(family, member, `${FAM_CODE[family]}: selector 不支持多值（'${name}'）`)
         continue
       }
+      selector = sel[0]
       // cache 参数：缺省 false；静态字符串按 === QueryCache.ONCE('once') 判定
       if (args[1]) {
-        const cacheStrs = resolveSources(args[1], ctx)
+        cacheStrs = resolveSources(args[1], ctx)
         if (cacheStrs && cacheStrs.length === 1) {
           // 'once' 字面量即可；其他字符串按非 ONCE 处理（与运行时 === 语义一致）
         } else if (
@@ -366,7 +417,7 @@ export function extractFieldAccessors(
         }
       }
     }
-    cands.push({ member, family, dec: nodes[0], decLocal })
+    cands.push({ member, family, dec: nodes[0], decLocal, selector, cacheStrs })
   }
 
   if (!cands.length) {
@@ -387,17 +438,14 @@ export function extractFieldAccessors(
     optsText?: string
     bodyText?: string
     model?: boolean
-    attr?: boolean
     selector?: string
     all?: boolean
     once?: boolean
     initText?: string
     /** 编译期推导的构造器名（与运行时 PropTypeMap 同域） */
     inferredType?: string
-    /** options 里已显式写了 type → 推导值不得覆盖 */
+    /** options 里已显式写了 type（或 spread 可能覆盖 type）→ 推导值不得覆盖 */
     explicitType?: boolean
-    /** options 里已显式写了 defaultValue → 不得重复 emit */
-    explicitDefault?: boolean
     /**
      * `@state m = this.<prop>` 的播种源。
      *
@@ -473,7 +521,7 @@ export function extractFieldAccessors(
       .filter((k): k is string => !!k),
   )
 
-  for (const { member, family, dec, decLocal } of cands) {
+  for (const { member, family, dec, decLocal, selector: qSel, cacheStrs: qCache } of cands) {
     if (failed.has(family)) continue
     const acc = accs[family]
     const name = keyName(member.key)!
@@ -481,10 +529,8 @@ export function extractFieldAccessors(
 
     if (family === 'prop') {
       let optsText = '{}'
-      let attr = true
       let model = false
       let explicitType = false
-      let explicitDefault = false
       if (expr.type === 'CallExpression') {
         const args = expr.arguments ?? []
         if (args.length !== 1) {
@@ -494,57 +540,68 @@ export function extractFieldAccessors(
         const optsNode = resolveOptsNode(family, member, args[0])
         if (!optsNode) continue
         optsText = code.slice(optsNode.start, optsNode.end)
-        for (const p of optsNode.properties ?? []) {
-          if (p.type === 'SpreadElement' || p.type === 'ExperimentalSpreadProperty') continue
-          const k = keyName(p.key)
-          if (k === 'attribute' && p.value?.type === 'BooleanLiteral') attr = p.value.value !== false
-          else if (k === 'attribute' && p.value?.type === 'Literal' && typeof p.value.value === 'boolean')
-            attr = p.value.value !== false
-          else if (k === 'attribute') {
+        const seq = flattenOptionProps(optsNode, ctx)
+        const opaque = hasOpaqueOption(seq)
+
+        const badKeys = unsupportedOptionKeys(seq, PROP_OPTION_KEYS)
+        if (badKeys.length) {
+          failMember(
+            family,
+            member,
+            `E-PROP-ARG: @prop 的选项 ${badKeys.map((k) => `'${k}'`).join('、')} 不受支持——` +
+              `PropOption 仅支持 ${[...PROP_OPTION_KEYS].join(' / ')}；默认值直接写在字段初始化器上`,
+          )
+          continue
+        }
+
+        const modelOpt = finalOption(seq, 'model')
+        if (modelOpt.known) {
+          const v = modelOpt.node
+          const isBool =
+            v?.type === 'BooleanLiteral' || (v?.type === 'Literal' && typeof v.value === 'boolean')
+          if (!isBool) {
+            failMember(family, member, `E-PROP-ARG: model 必须是布尔字面量（'${name}'）`)
+            continue
+          }
+          model = v.value === true
+        } else if (opaque) {
+          // spread 可能把 model 设为 true；按普通 setter 生成会静默破坏双向绑定。
+          failMember(
+            family,
+            member,
+            `E-PROP-ARG: options 的展开无法静态解析，无法确定 model（'${name}'）；` +
+              `请把 model 显式写在 @prop 字面量里`,
+          )
+          continue
+        }
+
+        const typeOpt = finalOption(seq, 'type')
+        // spread 若可能覆盖 type，则不再追加推导值，避免静默改掉运行期类型。
+        explicitType = typeOpt.known || opaque
+
+        const attrOpt = finalOption(seq, 'attribute')
+        if (attrOpt.known) {
+          const v = attrOpt.node
+          const isBool =
+            v?.type === 'BooleanLiteral' || (v?.type === 'Literal' && typeof v.value === 'boolean')
+          if (!isBool) {
             failMember(family, member, `E-PROP-ARG: attribute 必须是布尔字面量（'${name}'）`)
-            break
-          } else if (k === 'model') {
-            const v = p.value
-            const isBool = v?.type === 'BooleanLiteral' || (v?.type === 'Literal' && typeof v.value === 'boolean')
-            if (!isBool) {
-              failMember(family, member, `E-PROP-ARG: model 必须是布尔字面量（'${name}'）`)
-              break
-            }
-            model = v.value === true
-          } else if (k === 'type') {
-            explicitType = true
-          } else if (k === 'defaultValue') {
-            // 默认值不应出现在 @prop/@state options 里 —— 它属于字段初始化器
-            // （编译器对字面量推导出 `type`，对非字面量则信号初值即真值）；
-            // 当初为旧运行时兜底的 defaultValue 键在信号管线下是死字段。
-            failMember(family, member, `E-FIELD-ARG: @${family} 的 options 中不支持 defaultValue —— 直接在字段初始化器上声明改动` )
-            explicitDefault = true
+            continue
           }
         }
-        if (failed.has(family)) continue
       }
-      const meta = inferInitMeta(member.value, code)
+      const meta = inferInitMeta(member.value)
       acc.removals.push(memberSpan(member, dec))
       acc.items.push({
         name,
         optsText,
         model,
-        attr,
         initText: member.value ? code.slice(member.value.start, member.value.end) : undefined,
         inferredType: meta.typeName,
         explicitType,
-        explicitDefault,
       })
       acc.accessors.push(
         `get ${name}() { return this.__s.${name}.value }\n`,
-        // model prop 的 setter 语义按**宿主类型**三路分派，判据全在 writeModelProp 内：
-        //   ① compelem 父端接了 update:<name> ⇒ 父端是权威，可能对值做加工（校验、
-        //      clamp、格式化）。此时只 emit 不写本地：抢先写会白渲染一次，且用户看到
-        //      中间值闪烁（子写 15 → 显示 15 → 父 clamp 到 10 → 回灌 → 又变 10）。
-        //      值由父端回写后落回本地，Object.is 去重使其不会重复渲染。
-        //   ② 无人接 ⇒ 只 emit 会让值彻底蒸发（CompElem#emit 在无 wrapperComponent 时
-        //      直接 return，事件丢弃且本地不落值，用户输入凭空消失）⇒ 本地兜底。
-        //   ③ 无人接但宿主声明 emit-native ⇒ 既本地兜底又发原生 CustomEvent。
         model
           ? `set ${name}(__v) { ${h('writeModelProp')}(${JSON.stringify(name)}, __v, this) }\n`
           : `set ${name}(__v) { this.__s.${name}.value = __v }\n`,
@@ -552,19 +609,13 @@ export function extractFieldAccessors(
     } else if (family === 'state') {
       // 播种：`@state m = this.p` → seedProp。
       //
-      // 为什么不能真的当普通初始化求值：字段初始化跑在**构造期**，而 prop 的
-      // 真值要到 setup() 里 #initProps() 才落定（父端 property、HTML 属性都
-      // 晚于构造）。所以编译器识别出 `this.<ident>` 后**不** emit
-      // `signal(this.p)`（那样只拿到默认值），改为注入 `prop`（运行期键），
-      // 由 CompElem#initStates 读 `__data_[p]` 深拷贝回灌信号。
-      //
-      // `this.<x>` 指向本地 state / computed 字段时**不**算播种：
-      // 那是"抄兄弟字段初值"，构造期求值才是对的（见 localStateishFields 注释）。
+      // 字段初始化跑在构造期，而 prop 真值要到 setup() 里 #initProps() 才落定；
+      // 因此识别到 `this.<prop>` 时不能 emit `signal(this.p)`，改由
+      // CompElem#initStates 读 `__data_[p]` 深拷贝回灌。
+      // 指向本地 state / computed 时不播种（那是“抄兄弟字段初值”）。
       const rawSeed = parseSeedProp(member.value)
       const seedProp = rawSeed && !localStateishFields.has(rawSeed) ? rawSeed : undefined
       let optsText = '{}'
-      let explicitType = false
-      let explicitDefault = false
       if (expr.type === 'CallExpression') {
         const args = expr.arguments ?? []
         if (args.length !== 1) {
@@ -574,48 +625,27 @@ export function extractFieldAccessors(
         const optsNode = resolveOptsNode(family, member, args[0])
         if (!optsNode) continue
         optsText = code.slice(optsNode.start, optsNode.end)
-        for (const p of optsNode.properties ?? []) {
-          if (p.type === 'SpreadElement' || p.type === 'ExperimentalSpreadProperty') continue
-          const k = keyName(p.key)
-          if (k === 'type') {
-            // state 的类型由 TS 标注保证，运行期从不做校验/转换（那是 prop 的 attribute
-            // 通道才需要的），故 @state 不接受 type —— 写了也只是被忽略。
-            failMember(family, member, `E-FIELD-ARG: @state 的 options 中不支持 type —— 类型由 TS 标注表达，运行期不校验`)
-            explicitType = true
-          }
-          else if (k === 'defaultValue') {
-            failMember(family, member, `E-FIELD-ARG: @state 的 options 中不支持 defaultValue —— 直接在字段初始化器上声明`)
-            explicitDefault = true
-          }
-          else if (k === 'prop') {
-            // 播种语义由**初始化器**表达（`@state m = this.<prop>`）。
-            // 选项值本身就是 prop 名，直接把它翻译成新写法给用户 —— 这样提示
-            // 永远是可粘贴的完整替换，不用用户再倒推一遍。
-            const optName = typeof (p.value as any)?.value === 'string' ? (p.value as any).value as string : undefined
-            const src = member.value ? code.slice(member.value.start, member.value.end) : ''
-            const hint = optName !== undefined
-              ? `@state ${name} = this.${optName}`
-              : seedProp
-                ? `@state ${name} = ${src}`
-                : `@state ${name} = this.<prop>`
-            failMember(
-              family,
-              member,
-              `E-STATE-ARG: @state({prop}) 不是有效语法 —— 改用 ${hint}（初始化器形态；播种仍在 props 落定之后）`,
-            )
-          }
+        const seq = flattenOptionProps(optsNode, ctx)
+
+        const badKeys = unsupportedOptionKeys(seq, STATE_OPTION_KEYS)
+        if (badKeys.length) {
+          failMember(
+            family,
+            member,
+            `E-STATE-ARG: @state 的选项 ${badKeys.map((k) => `'${k}'`).join('、')} 不受支持——` +
+              `StateOption 仅支持 ${[...STATE_OPTION_KEYS].join(' / ')}；` +
+              `类型由 TS 标注表达，初始值/从 prop 播种直接写在字段初始化器上`,
+          )
+          continue
         }
       }
-      // 播种字段的初始值是死代码 → 它的 defaultValue / type 描述的是死值，谎报
-      const meta = seedProp ? {} : inferInitMeta(member.value, code)
+      const meta = seedProp ? {} : inferInitMeta(member.value)
       acc.removals.push(memberSpan(member, dec))
       acc.items.push({
         name,
         optsText,
         initText: member.value ? code.slice(member.value.start, member.value.end) : undefined,
         inferredType: meta.typeName,
-        explicitType,
-        explicitDefault,
         seedProp,
       })
       acc.accessors.push(
@@ -629,11 +659,11 @@ export function extractFieldAccessors(
       acc.accessors.push(`get ${name}() { return this.__s.${name}.value }\n`)
     } else {
       const args = expr.arguments ?? []
-      const selector = resolveSources(args[0], ctx)![0]
+      // 第一遍已对同一节点、同一 ctx 解析过（resolveSources 只读，结果必然一致）
+      const selector = qSel!
       let once = false
       if (args[1]) {
-        const cacheStrs = resolveSources(args[1], ctx)
-        if (cacheStrs && cacheStrs.length === 1) once = cacheStrs[0] === 'once'
+        if (qCache && qCache.length === 1) once = qCache[0] === 'once'
         else once = true
       }
       const all = comp.compelemImports.get(decLocal) === 'queryAll'
@@ -678,9 +708,13 @@ export function extractFieldAccessors(
    * vite 报 `vite:oxc PARSE_ERROR Unexpected token`）。
    *
    * 只吃**最后一个**字符为 `,` 的情况，故注释里带逗号（`{ a: 1 ␟,␟ }` 形式）不受影响。
+   *
+   * ⚠️ 先剥 `//` 行注释：fieldEntryText 会把本切片折进单行 `{ … }`，尾随行注释
+   * （`@prop({ type: String, // 说明\n})`）经 trim 失去换行后会吞掉产物的闭括号
+   * 与追加属性 ⇒ 注入产物语法错误。字符串里的 `//` 不受影响（见 stripLineComments）。
    */
   function optsInnerText(text: string): string {
-    let t = text.trim()
+    let t = stripLineComments(text).trim()
     if (t.charCodeAt(t.length - 1) === 44 /* , */) t = t.slice(0, -1).trim()
     return t
   }

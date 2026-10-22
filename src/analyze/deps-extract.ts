@@ -1,4 +1,4 @@
-﻿/**
+/**
  * cssVars / @computed getter 的响应式依赖静态提取（编译期静态分析）。
  *
  * 语义（只收集响应式读取；宁可省略键走全根兜底，不可欠收集）：
@@ -29,14 +29,14 @@
  * 调试：环境变量 DEPS_TRACE=1 时每次失败向 stderr 输出 `[deps-fail] <原因标签>`。
  */
 import type { ComponentAnalysis } from '../types'
-import { isTsWrapper, keyName, unwrapExpr } from '../utils/oxc'
-import { classInfoOf, superClassName } from './component'
+import { addDepPath, isTsWrapper, keyName, unwrapExpr } from '../utils/ast'
+import { classInfoOf, compelemResolver, superClassName, type ImportResolver } from './component'
 
 interface ExtractCtx {
   comp: ComponentAnalysis
   localClasses: Map<string, any>
-  /** 本组件可识别的 compelem 导入原名集合（用于链终点 CompElem 判定） */
-  aliases: Set<string>
+  /** compelem 导入名解析器（本地名 → 导入原名，用于链终点 CompElem 判定与类信息提取） */
+  resolve: ImportResolver
   /** this 等价类：预扫描收集的别名名 */
   aliasNames: Set<string>
   /** 豁免的 ThisExpression（别名/解构声明 init 位，身份判定） */
@@ -58,12 +58,10 @@ interface ExtractCtx {
 }
 
 function record(ctx: ExtractCtx, path: string[]) {
-  const full = path.join('.')
-  ctx.deps.add(full)
-  if (path.length > 1) ctx.deps.add(path[0])
+  addDepPath(ctx.deps, path)
 }
 
-/** TS 包装节点解包（`this as any` / `that!` 等）—— 统一实现在 utils/oxc#unwrapExpr。
+/** TS 包装节点解包（`this as any` / `that!` 等）—— 统一实现在 utils/ast#unwrapExpr。
  *  本副本原先比别处多认 `TSInstantiationExpression`、少认 `TSTypeAssertion`，已归一。 */
 
 /** 置失败标记；DEPS_TRACE=1 时输出原因标签（见文件头）。 */
@@ -310,14 +308,14 @@ function classifyPath(ctx: ExtractCtx, path: string[]): void {
   for (let i = 0; node && i < 8; i++) {
     const sup = superClassName(node)
     if (!sup) break
-    if (ctx.aliases.has('CompElem') && sup === 'CompElem') break // 链终点：根未知
+    if (ctx.resolve(sup) === 'CompElem') break // 链终点：根未知
     const parent = ctx.localClasses.get(sup)
     if (!parent || seenCls.has(parent)) {
       if (!parent) failAt(ctx, 'cross-file') // 跨文件基类 → 未知
       break
     }
     seenCls.add(parent)
-    const info = classInfoOf(parent, ctx.aliases)
+    const info = classInfoOf(parent, ctx.resolve)
     const hit = applyLevel(
       ctx,
       {
@@ -355,7 +353,7 @@ function inlineScanSuperCssVars(ctx: ExtractCtx): void {
   for (let i = 0; node && i < 8; i++) {
     const sup = superClassName(node)
     if (!sup) break
-    if (ctx.aliases.has('CompElem') && sup === 'CompElem') break // 链终点：基类无 cssVars 体
+    if (ctx.resolve(sup) === 'CompElem') break // 链终点：基类无 cssVars 体
     const parent = ctx.localClasses.get(sup)
     if (!parent) {
       failAt(ctx, 'cross-file')
@@ -363,7 +361,7 @@ function inlineScanSuperCssVars(ctx: ExtractCtx): void {
     }
     if (seenCls.has(parent)) break
     seenCls.add(parent)
-    const body = classInfoOf(parent, ctx.aliases).cssVarsBody
+    const body = classInfoOf(parent, ctx.resolve).cssVarsBody
     if (body && body.length) {
       // 递归的 `super.cssVars` 必须从 **parent** 继续往上找，而不是回到本组件
       inlineScan(ctx, body, parent)
@@ -562,7 +560,7 @@ function runExtract(
   const ctx: ExtractCtx = {
     comp,
     localClasses: localClasses ?? new Map(),
-    aliases: new Set(comp.compelemImports.values()),
+    resolve: compelemResolver(comp.compelemImports),
     aliasNames: new Set<string>(),
     exemptThis: new Set<object>(),
     deps: new Set<string>(),

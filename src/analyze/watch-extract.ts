@@ -15,12 +15,11 @@
  * （含成员访问，如 EV.TITLE —— 对齐 conventions 的 stringConsts 机制）。
  */
 import type { ComponentAnalysis } from '../types'
-import { keyName } from '../utils/oxc'
+import { keyName, IDENT_RE, stringify } from '../utils/ast'
 import { decoratorName, type ConventionError, type ConventionsContext } from './conventions'
-import { classInfoOf, superClassName } from './component'
+import { classInfoOf, compelemResolver, superClassName } from './component'
 
 /** 源码字面量序列化（与 codegen 各文件的同名局部常量一致） */
-const J = JSON.stringify
 
 export interface WatchEntry {
   /** 处理器方法名 */
@@ -40,12 +39,11 @@ export interface WatchExtractResult {
   removals: Array<{ start: number; end: number }>
   errors: ConventionError[]
   /**
-   * `entries` 是否已并入**同文件**基类链的 @watch（祖先在前）。
+   * `entries` 是否已并入**完整同文件**基类链的 @watch（祖先在前）。
    *
-   * codegen 据此决定还要不要把父类 `__ce_static__.watchEffects` 拼进来：
-   * 同文件继承链上，最后一个同文件基类自己发射的 `watchEffects` 与已内联的
-   * 那段前缀**内容完全相同**，再拼一次会让同一批处理器被执行两次
-   * （immediate 处理器副作用翻倍）。
+   * 仅当链最终到达 CompElem 时为 true。此时父类自己发射的 `watchEffects`
+   * 与已内联的前缀内容完全相同，再拼一次会让同一批处理器执行两次。
+   * 链上有跨文件基类时必须为 false，让 emitWatchEffects 保留 `super` 拼接。
    */
   inlinedAncestors: boolean
 }
@@ -93,7 +91,11 @@ export function generateWatchEffects(entries: WatchEntry[]): string {
     const readOf = (src: string): string => {
       const segs = src.split('.')
       const root = segs[0]
-      return `rc.__s.${root}.value${segs.slice(1).map((x) => '.' + x).join('')}`
+      // 多级路径必须逐段可选链：首轮对象可能尚未初始化（`@watch('form.name')`）。
+      const rest = segs.slice(1).map((x) =>
+        IDENT_RE.test(x) ? `?.${x}` : `?.[${JSON.stringify(x)}]`,
+      )
+      return `rc.__s.${root}?.value${rest.join('')}`
     }
     const reads = sources.map(readOf)
     const seed = `[${reads.join(', ')}]`
@@ -128,9 +130,9 @@ export function generateWatchEffects(entries: WatchEntry[]): string {
      * 方法体对 codegen 是黑盒（用户代码），无法静态剔除里面的读，故在调用点整体
      * 关闭收集。这是 `untrack` 唯一的内部使用点，也是它存在的理由。
      */
-    const call = (i: number) => `untrack(() => ${recv}.${name}(n[${i}], o[${i}], ${J(sources[i])}))`
+    const call = (i: number) => `untrack(() => ${recv}.${name}(n[${i}], o[${i}], ${stringify(sources[i])}))`
     /** immediate 前奏：ov 此刻尚不存在，按 API 传 undefined */
-    const callInit = (i: number) => `untrack(() => ${recv}.${name}(o[${i}], undefined, ${J(sources[i])}))`
+    const callInit = (i: number) => `untrack(() => ${recv}.${name}(o[${i}], undefined, ${stringify(sources[i])}))`
     const store = idx.map((i) => `o[${i}] = n[${i}]`).join('; ')
 
     if (once && immediate) {
@@ -215,13 +217,13 @@ function signalKeysOf(
     // CompElem 是框架基类，永远在链尾且不贡献响应式字段（slots 除外）——
     // 必须当终止条件返回已知键集，不能当成「本文件外的未知基类」而放弃校验，
     // 否则所有直接继承 CompElem 的组件（也就是绝大多数）都跳过检查。
-    if ([...comp.compelemImports.values()].includes(sup) && sup === 'CompElem') {
+    if (comp.compelemImports.get(sup) === 'CompElem') {
       keys.add('slots')
       return keys
     }
     const parent = ctx.localClasses.get(sup)
     if (!parent) return null // 基类在别处 → 不可知
-    const info = classInfoOf(parent, new Set(comp.compelemImports.values()))
+    const info = classInfoOf(parent, compelemResolver(comp.compelemImports))
     for (const k of info.fields.keys()) keys.add(k)
     cur = parent
   }
@@ -305,23 +307,30 @@ export function extractWatchers(
   const cls = comp.cls ?? ctx.localClasses.get(comp.className)
   if (!cls) return result
 
-  const aliases = new Set(comp.compelemImports.values())
+  const resolve = compelemResolver(comp.compelemImports)
   const isWatchDec = (local: string) => comp.compelemImports.get(local) === 'watch'
 
-  /** 沿 extends 链上溯同文件基类（遇 CompElem 或文件外基类即止），返回 [最远祖先 … 直接父类] */
-  const ancestorChain = (): Array<{ node: any; fields: Set<string> }> => {
+  /**
+   * 沿 extends 链上溯同文件基类，返回 [最远祖先 … 直接父类] 以及链是否**完整**。
+   *
+   * complete = 链最终到达 CompElem（或无 super）。只有完整链才能把祖先条目内联并
+   * 抑制 `super.watchEffects`；一旦遇到跨文件基类，祖先数组里可能还含更上层
+   * （跨文件）的 watch，必须保留 `super` 拼接，否则会静默丢掉它们。
+   */
+  const ancestorChain = (): { chain: Array<{ node: any; fields: Set<string> }>; complete: boolean } => {
     const chain: Array<{ node: any; fields: Set<string> }> = []
     let cur = cls
+    let complete = false
     for (let depth = 0; depth < 8; depth++) {
       const sup = superClassName(cur)
-      if (!sup) break
-      if (aliases.has(sup) && sup === 'CompElem') break
+      if (!sup) { complete = true; break }
+      if (resolve(sup) === 'CompElem') { complete = true; break }
       const parent = ctx.localClasses.get(sup)
-      if (!parent) break // 基类在本文件外，其 watch 由其自身所在文件处理
-      chain.push({ node: parent, fields: new Set(classInfoOf(parent, aliases).fields.keys()) })
+      if (!parent) { complete = false; break } // 基类在本文件外，其 watch 由其自身所在文件处理
+      chain.push({ node: parent, fields: new Set(classInfoOf(parent, resolve).fields.keys()) })
       cur = parent
     }
-    return chain.reverse()
+    return { chain: chain.reverse(), complete }
   }
 
   /**
@@ -340,6 +349,14 @@ export function extractWatchers(
         result.errors.push({ start: dec.start ?? expr.start, end: dec.end ?? expr.end, message: msg })
       }
 
+        // 处理器方法名必须是合法标识符：产物 emit `rc.<name>(…)` 点访问，
+        // 字符串字面量方法名（`'my-handler'(){}`）会拼出非法 JS（对齐 source
+        // 路径的字段校验；祖先条目在 !own 时静默跳过，由其所在文件自行上报）
+        if (!IDENT_RE.test(memberName)) {
+          fail(`E-WATCH-ARG: @watch 处理器方法名 '${memberName}' 不是合法标识符，无法前移（产物为 rc.<name>() 点访问）`)
+          return
+        }
+
         if (expr.type !== 'CallExpression') {
           fail(`E-WATCH-ARG: @watch 必须以调用形式使用（@watch(source, options?)），编译期无法解析`)
           return
@@ -350,6 +367,14 @@ export function extractWatchers(
         const sources = resolveSources(args[0], ctx)
         if (!sources) {
           fail(`E-WATCH-ARG: @watch 的 source 无法静态解析（须为字符串字面量、字符串数组或模块级字符串常量）`)
+          return
+        }
+        // 根必须是合法标识符；段可以是标识符或数字属性名。非法路径会生成坏 JS。
+        const badPath = sources.find(
+          (s) => !/^[A-Za-z_$][\w$]*(\.(?:[A-Za-z_$][\w$]*|[0-9]+))*$/.test(s),
+        )
+        if (badPath) {
+          fail(`E-WATCH-ARG: @watch 的 source '${badPath}' 不是合法字段路径（仅支持 a、a.b、a.0）`)
           return
         }
         // source 必须是**真信号键**。生成的 effect 读 `rc.__s.<s>.value`，
@@ -428,11 +453,15 @@ export function extractWatchers(
     }
   }
 
-  // 1) 祖先条目（远 → 近），使父类处理器在子类实例上同样生效
-  const chain = ancestorChain()
-  result.inlinedAncestors = chain.length > 0
-  for (const anc of chain) collect(anc.node, anc.fields, false)
-  // 2) 本类条目 + removals + errors
+  // 只有“同文件链完整到达 CompElem”时才内联祖先：否则 `super.watchEffects` 里
+  // 可能包含跨文件祖父的条目，压制它会静默丢 watch。链不完整时改为只收本类，
+  // 由 emitWatchEffects 统一拼 `super.watchEffects`。
+  const { chain, complete } = ancestorChain()
+  result.inlinedAncestors = complete && chain.length > 0
+  if (complete) {
+    for (const anc of chain) collect(anc.node, anc.fields, false)
+  }
+  // 本类条目 + removals + errors
   collect(cls, new Set(comp.fields.keys()), true)
   return result
 }

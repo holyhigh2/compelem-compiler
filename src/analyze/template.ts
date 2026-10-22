@@ -180,19 +180,3 @@ export function collectIssuesInSubtree(
   }
   visit(node)
 }
-
-/**
- * 扫描 render() 函数体，收集全部 D7 违规。
- *
- * 每个 h 模板的每个插值表达式都会单独检查；命中的插值各自报告一次，
- * 便于一次性定位所有待改点。
- */
-export function collectTemplateIssues(comp: ComponentAnalysis): TemplateIssue[] {
-  const hAliases = collectTemplateTagAliases(comp)
-  if (!hAliases.size) return []
-
-  const issues: TemplateIssue[] = []
-  const seen = new WeakSet<object>()
-  for (const stmt of comp.renderBody ?? []) collectIssuesInSubtree(stmt, hAliases, issues, seen)
-  return issues
-}

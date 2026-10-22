@@ -12,15 +12,16 @@
  *   安全全局，否则返回 errors（组件不可编译）——
  *   render() 局部变量无法在注入的静态函数作用域内解析。
  */
-import { keyName, parse } from '../utils/oxc'
+import { blockedTsText, containsBlockedTsNode, keyName, parseUncached } from '../utils/ast'
+import { scanJsText, degradePrivateNames } from '../utils/js-text'
 import { IMPURE_GLOBALS as IMPURE_GLOBAL_SET, KNOWN_GLOBALS } from '../utils/globals'
 import type { ComponentAnalysis } from '../types'
-import { TS_SYNTAX_RE, type MainTemplate } from '../analyze/template-extract'
+import { type MainTemplate } from '../analyze/template-extract'
 import { COMpelem_DIRECTIVES } from '../analyze/render-body'
 import {
   applySubIdWraps,
   partitionDirectiveArgs,
-  stripTs,
+  stripTsChecked,
   type SubCandidate,
 } from '../analyze/template-subs'
 
@@ -81,88 +82,32 @@ const SAFE_GLOBALS = KNOWN_GLOBALS
  */
 const IMPURE_GLOBALS = IMPURE_GLOBAL_SET
 
+/**
+ * TS 专有 AST 键（值在 JS 里不存在）：自由标识符 walk 一律不下钻。
+ * 类型位上的标识符是**类型名**，编译期擦除后既不是依赖也不是可解析引用，
+ * 收进自由集会给出「引用了 render() 局部标识符 'Foo'」这类无意义报错。
+ */
+const TS_ONLY_KEYS = new Set(['typeAnnotation', 'typeParameters', 'typeArguments', 'queryString', 'typeName'])
+
 // ---------- this 改写（字符串/模板字面量上下文感知） ----------
 
 /**
  * 把表达式源码中的 `this` 全部改写为 `thisName`（默认 `__comp`）。
- * 引号串与模板字面量内容不改写；模板字面量内的 `${...}` 表达式属于 JS 上下文，
+ * 字符串/注释/正则字面量内容不改写；模板字面量 `${...}` 表达式属于 JS 上下文，
  * 其中的 this 一并改写（子视图模板经 tmplFn.call(component) 求值，语义等价）。
- * 返回 null 表示改写后引号不配对（不可能出现在合法 JS 中，防御性返回）。
+ * 返回 null 表示引号/模板/注释/正则不闭合（防御性返回）。
  *
- * `thisName`：buildVars 的形参名是 `__comp`；per-point effect 的形参是 `rc`，
- * 内联表达式时传 `'rc'`（同一份扫描逻辑，两个调用点）。
+ * `thisName`：buildVars 的形参名是 `__comp`；per-point effect 的形参是 `rc`。
+ * 上下文识别统一在 `utils/js-text#scanJsText`。
  */
 export function rewriteThis(src: string, thisName = '__comp'): string | null {
+  const { mask, closed } = scanJsText(src)
+  if (!closed) return null
   let out = ''
-  // 上下文栈：'code | "'" | '"' | '`'。模板内 `${` 压入 code（带独立花括号深度）。
-  const stack: Array<{ t: string; brace?: number }> = [{ t: 'code', brace: 0 }]
   let i = 0
   const n = src.length
   while (i < n) {
-    const top = stack[stack.length - 1]
-    const c = src[i]
-    if (top.t === 'sq' || top.t === 'dq' || top.t === "'" || top.t === '"') {
-      if (c === '\\') {
-        out += src.slice(i, i + 2)
-        i += 2
-        continue
-      }
-      if (top.t === c) {
-        stack.pop()
-      }
-      out += c
-      i++
-      continue
-    }
-    if (top.t === 'tpl' || top.t === '`') {
-      if (c === '\\') {
-        out += src.slice(i, i + 2)
-        i += 2
-        continue
-      }
-      if (c === '`') {
-        stack.pop()
-        out += c
-        i++
-        continue
-      }
-      if (c === '$' && src[i + 1] === '{') {
-        stack.push({ t: 'code', brace: 0 })
-        out += '${'
-        i += 2
-        continue
-      }
-      out += c
-      i++
-      continue
-    }
-    // code 上下文
-    if (c === "'" || c === '"' || c === '`') {
-      stack.push({ t: c })
-      out += c
-      i++
-      continue
-    }
-    if (c === '{') {
-      top.brace = (top.brace ?? 0) + 1
-      out += c
-      i++
-      continue
-    }
-    if (c === '}') {
-      if ((top.brace ?? 0) === 0 && stack.length > 1) {
-        // 回到外层模板字面量
-        stack.pop()
-        out += c
-        i++
-        continue
-      }
-      top.brace = (top.brace ?? 0) - 1
-      out += c
-      i++
-      continue
-    }
-    if (c === 't' && src.startsWith('this', i)) {
+    if (mask[i] && src.startsWith('this', i)) {
       const prev = i > 0 ? src[i - 1] : ''
       const next = i + 4 < n ? src[i + 4] : ''
       const isWord = (ch: string) => /[A-Za-z0-9_$]/.test(ch)
@@ -172,14 +117,13 @@ export function rewriteThis(src: string, thisName = '__comp'): string | null {
         continue
       }
     }
-    out += c
+    out += src[i]
     i++
   }
-  if (stack.length !== 1) return null
   return out
 }
 
-// ---------- 自由标识符校验（oxc AST 精确解析） ----------
+// ---------- 自由标识符校验（AST 精确解析） ----------
 
 /** 表达式 this 链分类收集——roots 命中响应式字段的根名；uncertain 放弃静态分类。 */
 interface ChainOut {
@@ -228,6 +172,9 @@ function classifyThisChain(node: any, out: ChainOut, comp?: ComponentAnalysis): 
  * @param comp 提供 compelem 指令识别：模板回调实参整棵跳过（其自由标识符由子模板
  *             freeIdentifiersInFn 单独校验），避免把回调闭包误报为主表达式依赖。
  * @param chainOut 可选——同时分类收集 this 链根名（与自由标识符同一次解析）。
+ * @param prelude 主模板 render() 的前置语句：拼进 wrapper 只为「建作用域」，让
+ *            插值里引用 prelude 局部变量时不被误判为自由标识符（见 collectFreeWalk）。
+ *            它的私有名同样要降级 —— 漏了这一半就是 2026-10-21 的编译白屏。
  */
 function freeIdentifiers(
   expr: string,
@@ -237,10 +184,14 @@ function freeIdentifiers(
 ): Set<string> | null {
   let fnBody: any
   try {
-    const wrapper = prelude
-      ? `(function(){ ${prelude}\nreturn (${expr}) })`
-      : `(function(){ return (${expr}) })`
-    const parsed = parse(wrapper, 'buildvars-check.js')
+    const safe = degradePrivateNames(expr)
+    // prelude 走同一降级：它和 expr 拼在同一个裸函数里，任何一侧残留 `#x` 都会
+    // 让整个 wrapper parse 失败（错误文案只会指到「插值 #N」，不说是 prelude）。
+    const safePrelude = prelude ? degradePrivateNames(prelude) : ''
+    const wrapper = safePrelude
+      ? `(function(){ ${safePrelude}\nreturn (${safe}) })`
+      : `(function(){ return (${safe}) })`
+    const parsed = parseUncached(wrapper)
     fnBody = parsed.program?.body?.[0]?.expression?.body
   } catch {
     return null
@@ -450,6 +401,9 @@ function collectFreeWalk(ret: any, comp?: ComponentAnalysis, chainOut?: ChainOut
     }
     for (const k of Object.keys(node)) {
       if (k === 'type' || k === 'start' || k === 'end' || k === 'parent') continue
+      // TS 专有键：值在剥离后不存在，其中的标识符是**类型名**（编译期即擦除），
+      // 收进自由集会既漏又误报 —— `<T>x` / `f<T>()` 里的 T 不是运行期引用。
+      if (TS_ONLY_KEYS.has(k)) continue
       const v = (node as any)[k]
       if (Array.isArray(v)) for (const c of v) walk(c, false)
       else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v, false)
@@ -516,6 +470,8 @@ function collectRejectedFree(
   return out
 }
 
+const BV_OK = '__ce_bv_ok__'
+
 /**
  * 生成 buildVars 函数源码。任一插值无法安全静态化 → 返回 errors（调用方放弃注入）。
  *
@@ -530,20 +486,17 @@ export function generateBuildVars(
   opts?: BuildVarsOptions,
 ): BuildVarsResult {
   const exprs: string[] = []
+  const depsDisplay = opts?.depsDisplay === true
   const hasWraps = source != null && !!candidates?.length
   const extras = opts?.extras
   // 根名/'' → 输出下标脏映射；'' 收集常脏（uncertain/不纯）表达式
   const biMap: Record<string, number[]> = {}
   const alwaysDirty: number[] = []
 
-  // ---- prelude：stripTs → TS 复检 ----
+  // ---- prelude：stripTs → TS 复检（仅门禁；产物 prelude 由 render-effect 另路注入）----
   const rawPrelude = tmpl.preludeSrc ?? ''
-  let preludeOut = ''
-  if (rawPrelude) {
-    preludeOut = stripTs(rawPrelude)
-    if (TS_SYNTAX_RE.test(preludeOut)) {
-      return { code: null, errors: [`prelude 含 TS 专有语法（as/satisfies/非空断言），放弃注入`] }
-    }
+  if (rawPrelude && stripTsChecked(rawPrelude).tsHit) {
+    return { code: null, errors: [`prelude 含 TS 专有语法（as/satisfies/非空断言），放弃注入`] }
   }
 
   for (const v of tmpl.vars) {
@@ -552,11 +505,12 @@ export function generateBuildVars(
     // 与 template-dom 的 emitText 共用 `fragment` 标记，两边同跳 ⇒ varIndex 对齐。
     if (v.fragment) continue
     // 顺序：raw free-check（跳过模板回调）→ wraps → stripTs → TS 复检 → super 改写 → this 改写
-    const chainOut: ChainOut = { roots: new Set(), uncertain: false }
+    // 根名分类仅供 verbose 依赖清单展示；默认跳过，省每个插值一次链分类。
+    const chainOut: ChainOut | null = depsDisplay ? { roots: new Set(), uncertain: false } : null
     // U2：模块 AST 节点直达（免 wrapper 重 parse）；节点缺失（手工构造 vars）回退字符串路径
     const free = v.node
-      ? freeIdentifiersFromNode(v.node, v.exprSource, comp, chainOut, rawPrelude)
-      : freeIdentifiers(v.exprSource, comp, chainOut, rawPrelude)
+      ? freeIdentifiersFromNode(v.node, v.exprSource, comp, chainOut ?? undefined, rawPrelude)
+      : freeIdentifiers(v.exprSource, comp, chainOut ?? undefined, rawPrelude)
     const freeErr = filterFree(free, comp, label, opts?.extraAllowed)
     if (freeErr) {
       return { code: null, errors: freeErr, freeIds: collectRejectedFree(free, comp) }
@@ -576,37 +530,35 @@ export function generateBuildVars(
     if (hasWraps && typeof v.start === 'number' && typeof v.end === 'number') {
       src = applySubIdWraps(v.start, v.end, source!, candidates!, extras, opts?.carriers)
     }
-    src = stripTs(src)
-    if (TS_SYNTAX_RE.test(src)) {
+    const c = stripTsChecked(src)
+    if (c.tsHit) {
       return { code: null, errors: [`${label} 含 TS 专有语法（as/satisfies/非空断言），放弃注入`] }
     }
-    const rw = rewriteThis(src)
+    const rw = rewriteThis(c.stripped)
     if (rw == null) {
       return { code: null, errors: [`${label} 的 this 改写失败（引号上下文异常）`] }
     }
     const outIdx = exprs.length
-    if (chainOut.uncertain || impureFree) {
-      alwaysDirty.push(outIdx)
-    }
-    // 按名映射与常脏**双写**（脏集是并集，行为不变）：uncertain 表达式里的已知/未声明根
-    // 同样建键 → 依赖清单能按变量展示其槽位与 updater（'' 常脏仅作保底）。
-    if (chainOut.roots.size) {
-      for (const r of chainOut.roots) {
-        let arr = biMap[r]
-        if (!arr) biMap[r] = arr = []
-        arr.push(outIdx)
+    if (depsDisplay && chainOut) {
+      if (chainOut.uncertain || impureFree) {
+        alwaysDirty.push(outIdx)
+      }
+      // 按名映射与常脏**双写**（脏集是并集，行为不变）：uncertain 表达式里的已知/未声明根
+      // 同样建键 → 依赖清单能按变量展示其槽位与 updater（'' 常脏仅作保底）。
+      if (chainOut.roots.size) {
+        for (const r of chainOut.roots) {
+          let arr = biMap[r]
+          if (!arr) biMap[r] = arr = []
+          arr.push(outIdx)
+        }
       }
     }
     exprs.push(rw)
   }
-  // guarded codegen——取值函数只对 __d 内下标求值，干净槽位返回占位 0
-  // （区间扫描不读）；无 __d 即全量求值。
-  const guarded = exprs.map((e, i) => `__d&&!__d.has(${i})?0:${e}`)
-  const code = `function(__comp, __d) { ${preludeOut}\nreturn [${guarded.join(', ')}] }`
-  if (alwaysDirty.length) biMap[''] = alwaysDirty
-  const hasBi = Object.keys(biMap).length > 0
+  if (depsDisplay && alwaysDirty.length) biMap[''] = alwaysDirty
+  const hasBi = depsDisplay && Object.keys(biMap).length > 0
   return {
-    code,
+    code: BV_OK,
     errors: [],
     viewDepVarIndices: hasBi ? biMap : undefined,
   }
@@ -639,12 +591,10 @@ export function generateSubBuildVars(
     return { code: null, errors: freeErr, freeIds: collectRejectedFree(free, comp) }
   }
 
-  // ---- prelude：wraps → stripTs → TS 复检 ----
-  let preludeOut = ''
+  // ---- prelude：wraps → stripTs → TS 复检（仅门禁；sub 产物 prelude 由 buildSubInliner 另路处理）----
   if (rawPrelude) {
-    preludeOut = applySubIdWraps(cand.preludeStart, cand.preludeEnd, source, allCandidates, extras, opts?.carriers)
-    preludeOut = stripTs(preludeOut)
-    if (TS_SYNTAX_RE.test(preludeOut)) {
+    const wrapped = applySubIdWraps(cand.preludeStart, cand.preludeEnd, source, allCandidates, extras, opts?.carriers)
+    if (stripTsChecked(wrapped).tsHit) {
       return { code: null, errors: [`${label} prelude 含 TS 专有语法，放弃注入`] }
     }
   }
@@ -659,17 +609,21 @@ const exprsOut: string[] = []
 for (const v of cand.vars) {
     // `${CONST}` 静态片段：不参与取值（与主模板 generateBuildVars 的跳过规则一致）
     if (v.fragment) continue
+    // C-G6②：子插值 AST 直达——旧式尖括号断言 / 显式实例化不被支持（与主模板 ① 同源）。
+    if (v.node && containsBlockedTsNode(v.node)) {
+      return { code: null, errors: [blockedTsText(`${label} 插值 #${v.index}`, v.exprSource)] }
+    }
     let src =
       typeof v.start === 'number' && typeof v.end === 'number'
         ? applySubIdWraps(v.start, v.end, source, allCandidates, extras, opts?.carriers)
         : v.exprSource
     let chainOut: ChainOut | null = depsDisplay ? { roots: new Set(), uncertain: false } : null
     if (chainOut) freeIdentifiers(src, comp, chainOut)
-    src = stripTs(src)
-    if (TS_SYNTAX_RE.test(src)) {
+    const c = stripTsChecked(src)
+    if (c.tsHit) {
       return { code: null, errors: [`${label} 插值 #${v.index} 含 TS 专有语法，放弃注入`] }
     }
-    const rw = rewriteThis(src)
+    const rw = rewriteThis(c.stripped)
     if (rw == null) {
       return { code: null, errors: [`${label} 插值 #${v.index} 的 this 改写失败`] }
     }
@@ -689,9 +643,8 @@ for (const v of cand.vars) {
   }
   if (alwaysDirty.length) biMap[''] = alwaysDirty
 
-  const code = `function(__comp${paramsCode}) { ${preludeOut}\nreturn [${exprsOut.join(', ')}] }`
   return {
-    code,
+    code: BV_OK,
     errors: [],
     viewDepVarIndices: depsDisplay && Object.keys(biMap).length ? biMap : undefined,
   }

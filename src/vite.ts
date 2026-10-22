@@ -10,11 +10,11 @@
  * 通过 `enforce: 'pre'` + `transform` 钩子工作：在 TS→JS 转换之前拿到 `.ts` 源码，
  * 注入 `static __ce_static__` 后交回后续插件链。
  */
-import type { CompilerOptions } from './types'
-import { compileFile } from './compile'
-import { hash32 } from './utils/oxc'
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { compileFile } from './compile'
+import type { CompilerOptions } from './types'
+import { hash32 } from './utils/ast'
 
 /** 极简的结构化插件类型，避免硬依赖 vite 的 types（peer 里 vite 是可选的）。 */
 interface MinimalPlugin {
@@ -27,6 +27,25 @@ interface MinimalPlugin {
 
 const TAG_RE = /@tag\(\s*['"]([^'"]+)['"]/g
 
+/**
+ * 用于 transform 缓存键的按文件指纹（见 tagFingerprint）。
+ */
+const FILE_HYPHEN_TAG_RE = /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)/g
+
+/**
+ * 按文件标签指纹（替代全局 `knownTags.size`）。
+ */
+function tagFingerprint(usedTags: Set<string>, knownTags: Set<string>): string {
+  if (usedTags.size === 0) return ''
+  const inter: string[] = []
+  for (const t of usedTags) if (knownTags.has(t)) inter.push(t)
+  if (inter.length === 0) return ''
+  inter.sort()
+  return hash32(inter.join('\n'))
+}
+
+const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'out', 'coverage'])
+
 /** 递归收集 root 下 .ts/.tsx 的 @tag 名（跨文件标签注册表，TEMPLATE-CODEGEN.md §4）。 */
 function scanKnownTags(root: string, out: Set<string>, depth = 0): void {
   if (depth > 20) return
@@ -37,13 +56,14 @@ function scanKnownTags(root: string, out: Set<string>, depth = 0): void {
     return
   }
   for (const e of entries) {
-    if (e.name === 'node_modules' || e.name.startsWith('.')) continue
-    const p = join(root, e.name)
+    if (e.name.startsWith('.')) continue
     if (e.isDirectory()) {
-      scanKnownTags(p, out, depth + 1)
+      if (SKIP_DIRS.has(e.name)) continue
+      scanKnownTags(join(root, e.name), out, depth + 1)
     } else if (/\.tsx?$/.test(e.name) && !e.name.endsWith('.d.ts')) {
       try {
-        const code = readFileSync(p, 'utf-8')
+        const code = readFileSync(join(root, e.name), 'utf-8')
+        if (code.indexOf('@tag') < 0 && code.indexOf('CompElem') < 0) continue
         TAG_RE.lastIndex = 0
         let m
         while ((m = TAG_RE.exec(code))) out.add(m[1].toLowerCase())
@@ -63,22 +83,12 @@ export interface VitePluginOptions extends CompilerOptions {
    */
   conventions?: 'error' | 'warn' | 'silent'
 
-  // 静态分析闸门（D 系列）**不提供力度选项**：基于 signal 模型的架构必须经编译器
-  // 编译后执行，推不出正确依赖时唯一正确的做法是报错，而不是产出「运行时静默不渲染 /
-  // 渲染错」的凑合产物。故 D 系列命中由 compileFile 直接抛 StaticAnalysisError，
-  // 在这里冒泡成构建错误，无 warn/silent 档位可言。
-
   /**
    * 调试用：把编译产物写到源文件同级（`foo.ts` → `foo.js`），便于直接查看
    * 注入后的 `__ce_static__` / buildTemplate / pointEffects / fx。
    * 仅对真实文件生效（跳过 `?v=` 之类的虚拟 id），且只在编译确有改动时写。
    */
   emitJs?: boolean
-  /**
-   * 调试编译产物用：令 sourcemap 以上游注入后的 TS 为 0 级原�?   * 这样 DevTools 直接显示编译后代码（含 `__ce_static__` / buildTemplate / fx），
-   * 在这些区域打的断点能命中。代价：跳过「编译后代码 → 原始模板」的映射，
-   * 栈帧行号指向注入后的 TS 而非用户源码里的模板位置。默认 `false`。
-   */
   debugSourceMap?: boolean
 }
 
@@ -113,32 +123,29 @@ function offsetToLineCol(code: string, offset: number, nl?: Int32Array): string 
   return `${lo + 1}:${offset - lastNl}`
 }
 
-/** 收集全部诊断违规（D7 或约定错误），带上 id / 行列信息。 */
 /**
- * 从 diagnostics 收集**约定错误**（E-*）为可上报文本。
- *
- * ⚠️ 只有约定错误。静态分析未通过的组件由 `compileFile` **抛** `StaticAnalysisError`，
- * 在这里就冒泡成构建错误了 —— 不会出现在 `res.diagnostics` 里。故本函数无需
- * （也无法）处理 D 系列。
+ * 从 diagnostics 收集**约定诊断**为可上报文本，按 severity 分为 errs（E-*）与 warns（W-*）
  */
 function collectErrors(
   res: ReturnType<typeof compileFile>,
   code: string,
   id: string,
   root: string,
-): string[] {
-  const out: string[] = []
+): { errs: string[]; warns: string[] } {
+  const errs: string[] = []
+  const warns: string[] = []
   const rel = id.startsWith(root) ? id.replace(/\\/g, '/').slice(root.replace(/\\/g, '/').length + 1) : id
   let nl: Int32Array | undefined
   for (const d of res.diagnostics) {
-    const list = d.conventionErrors?.map((e) => ({ offset: e.start, message: e.message })) ?? []
+    const list = d.conventionErrors?.map((e) => ({ offset: e.start, message: e.message, severity: e.severity })) ?? []
     for (const e of list) {
       nl ??= newlineIndex(code)
       const at = offsetToLineCol(code, e.offset, nl)
-      out.push(`${rel}:${at} [${d.className}] ${e.message}`)
+      const line = `${rel}:${at} [${d.className}] ${e.message}`
+        ; (e.severity === 'warn' ? warns : errs).push(line)
     }
   }
-  return out
+  return { errs, warns }
 }
 
 /** 按 mode 上报违规（error 阻断构建 / warn 控制台 / silent 忽略）。 */
@@ -161,10 +168,6 @@ export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin
   const knownTags = new Set<string>()
   if (options.knownTags) for (const t of options.knownTags) knownTags.add(t.toLowerCase())
   let scanned = false
-  // U4：transform 结果缓存（key = id + 源码哈希 + knownTags 版本）。
-  // compileFile 对 (code,id,options) 纯函数（无 console/全局副作用），诊断随 res 缓存；
-  // knownTags 只增不减 → size 即单调版本号（本文件 TAG_RE 扫描先跑后取 key，幂等）。
-  // FIFO 上限防 dev 长会话内存增长；命中仍走全部 reporting（每次 transform 都要报）。
   const transformCache = new Map<string, ReturnType<typeof compileFile>>()
   const TRANSFORM_CACHE_MAX = 512
 
@@ -184,6 +187,11 @@ export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin
     },
 
     transform(code: string, id: string) {
+      if (id.includes('\0')) return null
+      const clean = id.split('?')[0]
+      if (!/\.(?:m|c)?(?:tsx?|jsx?)$/.test(clean)) return null
+      if (clean.includes('node_modules')) return null
+
       // 惰性兜底：buildStart 未触发（如纯 API 调用）时按需扫描
       if (!scanned) {
         scanned = true
@@ -191,10 +199,18 @@ export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin
       }
       // 本文件新出现的 @tag 立即并入（预扫后新增的热更场景；Set 幂等）
       TAG_RE.lastIndex = 0
+      FILE_HYPHEN_TAG_RE.lastIndex = 0
       let tm
-      while ((tm = TAG_RE.exec(code))) knownTags.add(tm[1].toLowerCase())
+      const usedTags = new Set<string>()
+      while ((tm = TAG_RE.exec(code))) {
+        const t = tm[1].toLowerCase()
+        knownTags.add(t)
+        usedTags.add(t)
+      }
+      let hm
+      while ((hm = FILE_HYPHEN_TAG_RE.exec(code))) usedTags.add(hm[1].toLowerCase())
 
-      const cacheKey = id + '\0' + hash32(code) + '\0' + knownTags.size
+      const cacheKey = id + '\0' + hash32(code) + '\0' + tagFingerprint(usedTags, knownTags)
       let res = transformCache.get(cacheKey)
       if (!res) {
         res = compileFile(code, id, {
@@ -210,10 +226,12 @@ export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin
         transformCache.set(cacheKey, res)
       }
 
-      // 约定错误：独立于静态分析闸门，默认直接阻断构建
+      // 约定错误：独立于静态分析闸门，默认直接阻断构建；
+      // W 码（severity:'warn'，如 W-PROP-CUSTOM-CTOR）恒为控制台提示，不随档位阻断。
       if (convMode !== 'silent') {
-        const msgs = collectErrors(res, code, id, root)
-        reportErrors(msgs, convMode, `[compelem/compiler] 检测到 ${msgs.length} 处约定错误：`, this)
+        const { errs, warns } = collectErrors(res, code, id, root)
+        if (warns.length) console.warn(`[compelem/compiler] ${warns.length} 条提示：\n  ` + warns.join('\n  '))
+        reportErrors(errs, convMode, `[compelem/compiler] 检测到 ${errs.length} 处约定错误：`, this)
       }
 
       if (!res.changed) return null

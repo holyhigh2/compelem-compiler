@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 约定错误静态检查（对应运行时 showError/showTagError 中「可静态判定」的调用点）。
  *
  * 设计原则（对齐 docs/TEMPLATE-CODEGEN.md §5「仅静态编译」）：
@@ -10,8 +10,12 @@
  *   E-EMIT-UNDECLARED   emit 事件名未在 @emits 声明        ← CompElem.ts:1273 / event.ts matchEmit
  *   E-EMITS-ARG         @emits(...) 实参无法静态解析       ← 装饰期静默收 Set，无法校验
  *   E-PROP-TYPE         @prop 无默认值且未声明 type        ← CompElem.ts（编译期唯一入口）
- *   E-PROP-CASE         @prop 字段名非 lowerCamelCase      ← prop.ts:35
- *   E-PROP-ASSIGN       组件内对 this.<非model prop> 赋值  ← prop.ts:105-113（set 通道仅 model 开放）
+ *   W-PROP-CUSTOM-CTOR  @prop type 含自定义构造器且无 converter ← utils.ts convertValue 的 DEV 提示（已删）
+ *   W-PROP-CASE         @prop 字段名非 lowerCamelCase（运行期按 kebabCase 映射，功能正常，仅风格提示）；
+ *                       只有与另一 prop 撞同一属性名时才升为 E-PROP-CASE（真的互相覆盖）
+ *   E-PROP-ASSIGN       组件内对 this.<非model prop> 赋值  ← 单向数据流约定（非运行时约束，见检查点注释）
+ *   W-FIELD-OPT-DEAD    @prop/@state 的 shallow|hasChanged 运行期零消费点（声明在，实现不在）
+ *   W-LIFECYCLE-TYPO    与基类生命周期名只差一字符、且本文件内无任何引用的方法（拼错的静默失效）
  *   E-COMPUTED-NOT-GETTER @computed 用在非 getter 上       ← computed.ts（编译期唯一入口）
  *   E-CSSCOPE-TARGET    @csscope 用在非 static getter 上   ← csscope.ts（编译期唯一入口）
  *
@@ -25,13 +29,15 @@ import type { ComponentAnalysis } from '../types'
 // unwrapTsExpr 是 unwrapExpr 的历史名（field-extract / method-deco-extract /
 // template-rules / literal-meta 仍在用），在此转出以免改动那些 import 路径。
 // 本文件原先那份实现**不认** TSTypeAssertion（`<T>x`），已随统一修正。
-import { decoratorName, keyName, superClassName, unwrapExpr } from '../utils/oxc'
+import { decoratorName, keyName, superClassName, unwrapExpr } from '../utils/ast'
 export { decoratorName, unwrapExpr as unwrapTsExpr }
 
 export interface ConventionError {
   start: number
   end: number
   message: string
+  /** 'warn'：提示级（合法但易踩坑），恒走 console.warn，不随 conventions 档位阻断构建。缺省 error。 */
+  severity?: 'warn'
 }
 
 export interface ConventionsContext {
@@ -61,12 +67,12 @@ export interface ConventionsContext {
   code?: string
 }
 
-/** isStringLiteral：覆盖 oxc 的 Literal / StringLiteral 两种形态。 */
+/** isStringLiteral：覆盖 `Literal` / `StringLiteral` 两种形态（estree / babel 原生）。 */
 function isStringLiteral(n: any): boolean {
   return !!n && (n.type === 'StringLiteral' || (n.type === 'Literal' && typeof n.value === 'string'))
 }
 
-/** 对象属性节点：oxc 产出 `Property`（ESTree 形态），兼容 `ObjectProperty`。 */
+/** 对象属性节点：estree 形态产出 `Property`，兼容 babel 原生 `ObjectProperty`。 */
 function isObjectProp(p: any): boolean {
   return !!p && (p.type === 'Property' || p.type === 'ObjectProperty') && !p.computed
 }
@@ -283,6 +289,7 @@ function collectDeclaredEmits(
   cls: any,
   ctx: ConventionsContext,
   isEmitsDec: (localName: string) => boolean,
+  isCompElem: (localName: string) => boolean,
   errs: ConventionError[],
 ): { declared: Set<string>; hasOpaque: boolean } {
   const out = new Set<string>()
@@ -308,7 +315,14 @@ function collectDeclaredEmits(
       }
     }
     const sup = superClassName(node)
-    if (sup && ctx.localClasses.has(sup)) visit(ctx.localClasses.get(sup))
+    if (!sup || isCompElem(sup)) return
+    const parent = ctx.localClasses.get(sup)
+    if (parent) visit(parent)
+    else {
+      // 跨文件基类可能声明了 @emits；看不到就标记声明集不完整，
+      // 放弃 UNDECLARED 校验，避免把继承事件误报成未声明。
+      hasOpaque = true
+    }
   }
   visit(cls)
   return { declared: out, hasOpaque }
@@ -353,8 +367,20 @@ function collectThisUsage(memberFn: any, code?: string): ThisUsage {
         usage.emitCalls.push({ node: n, arg: n.arguments[0] })
       }
     }
-    if (!fnBarrier && n.type === 'AssignmentExpression' && n.operator === '=') {
+    if (!fnBarrier && n.type === 'AssignmentExpression') {
       const l = n.left
+      if (
+        l?.type === 'MemberExpression' &&
+        !l.computed &&
+        l.object?.type === 'ThisExpression' &&
+        keyName(l.property)
+      ) {
+        // 任何赋值运算符都算：=、+=、??=、||= ……
+        usage.propAssignments.push({ node: n, propName: keyName(l.property)! })
+      }
+    }
+    if (!fnBarrier && n.type === 'UpdateExpression' && (n.operator === '++' || n.operator === '--')) {
+      const l = n.argument
       if (
         l?.type === 'MemberExpression' &&
         !l.computed &&
@@ -382,9 +408,11 @@ function collectThisUsage(memberFn: any, code?: string): ThisUsage {
 }
 
 /** 提取装饰器实参里的 options 对象节点（无参形态返回 null；Identifier 经 moduleConsts 内联解析）。 */
-function decoratorOptionsNode(member: any, decName: string, isDec: (n: string) => boolean, ctx?: ConventionsContext): any | null {
+function decoratorOptionsNode(member: any, isDec: (n: string) => boolean, ctx?: ConventionsContext): any | null {
   for (const dec of member.decorators ?? []) {
-    if (decoratorName(dec) !== decName || !isDec(decName)) continue
+    const dn = decoratorName(dec)
+    // 必须按 isDec(local) 匹配：import { prop as p } 时本地名是 p，不是 prop。
+    if (!dn || !isDec(dn)) continue
     const expr = dec.expression ?? dec
     if (expr.type === 'CallExpression') {
       const a0 = expr.arguments?.[0]
@@ -400,12 +428,189 @@ function decoratorOptionsNode(member: any, decName: string, isDec: (n: string) =
   return null
 }
 
-function objectHasTrueProp(optsNode: any, key: string): boolean {
-  if (!optsNode) return false
-  for (const p of optsNode.properties ?? []) {
-    if (keyName(p.key) === key && p.value?.value === true) return true
+/** 展开后的 options 序列：对象字面量属性与“无法静态解析的 spread”占位。 */
+export type OptionEntry = { kind: 'prop'; node: any } | { kind: 'opaque' }
+
+/**
+ * 展开 options 对象（含同文件 const 对象与可解析的 spread）。
+ *
+ * 无法解析的 spread 记为 opaque：调用方既不能假设某个 key 不存在，也不能
+ * 假设其值；需要精确语义（model setter / type）时必须保守处理。
+ */
+export function flattenOptionProps(
+  node: any,
+  ctx?: ConventionsContext,
+  depth = 0,
+  seen: Set<any> = new Set(),
+): OptionEntry[] {
+  const obj = unwrapExpr(node)
+  if (!obj || obj.type !== 'ObjectExpression' || depth > 8 || seen.has(obj)) {
+    return [{ kind: 'opaque' }]
   }
-  return false
+  const nextSeen = new Set(seen).add(obj)
+  const out: OptionEntry[] = []
+  for (const p of obj.properties ?? []) {
+    if (p.type === 'SpreadElement' || p.type === 'ExperimentalSpreadProperty') {
+      const arg = unwrapExpr(p.argument)
+      let init: any
+      if (arg?.type === 'ObjectExpression') init = arg
+      else if (arg?.type === 'Identifier' && ctx?.moduleConsts?.has(arg.name)) {
+        init = unwrapExpr(ctx.moduleConsts.get(arg.name))
+      }
+      if (init?.type === 'ObjectExpression') {
+        out.push(...flattenOptionProps(init, ctx, depth + 1, nextSeen))
+      } else {
+        out.push({ kind: 'opaque' })
+      }
+      continue
+    }
+    if (p.computed && !(p.key?.type === 'Literal' || p.key?.type === 'StringLiteral')) {
+      out.push({ kind: 'opaque' })
+      continue
+    }
+    out.push({ kind: 'prop', node: p })
+  }
+  return out
+}
+
+/** 某个 key 在展开序列里的“最后一次赋值”状态。 */
+export function finalOption(
+  entries: OptionEntry[],
+  key: string,
+): { known: boolean; node?: any } {
+  let known = false
+  let node: any
+  for (const e of entries) {
+    if (e.kind === 'opaque') {
+      // opaque spread 可能覆盖任意 key；只有其后的显式属性才能恢复“已知”
+      known = false
+      node = undefined
+      continue
+    }
+    if (keyName(e.node.key) === key) {
+      known = true
+      node = e.node.value
+    }
+  }
+  return { known, node }
+}
+
+/** 展开序列中是否存在无法静态解析的 spread。 */
+export function hasOpaqueOption(entries: OptionEntry[]): boolean {
+  return entries.some((e) => e.kind === 'opaque')
+}
+
+/** convertValue 内建处理的构造器名（其余构造器走 new t(字符串) 路径）。 */
+const BUILTIN_TYPE_NAMES: ReadonlySet<string> = new Set([
+  'String', 'Number', 'Boolean', 'Object', 'Array', 'Date', 'Function',
+])
+
+/**
+ * type 选项里的自定义构造器标识符名。仅识别 Identifier 与全 Identifier 的
+ * ArrayExpression；其它形态（成员访问、表达式、变量引用）无法静态判定 → 返回空（宁漏勿误报）。
+ */
+function customCtorTypeNames(node: any): string[] {
+  const v = unwrapExpr(node)
+  const one = (n: any): string | undefined => {
+    if (n?.type !== 'Identifier') return undefined
+    return BUILTIN_TYPE_NAMES.has(n.name) ? undefined : n.name
+  }
+  if (v?.type === 'Identifier') {
+    const n = one(v)
+    return n ? [n] : []
+  }
+  if (v?.type === 'ArrayExpression') {
+    const out: string[] = []
+    for (const el of v.elements ?? []) {
+      if (el?.type !== 'Identifier') return []
+      const n = one(el)
+      if (n && !out.includes(n)) out.push(n)
+    }
+    return out
+  }
+  return []
+}
+
+/**
+ * prop / state 声明名 → 运行期 HTML attribute 名。
+ *
+ * 对齐 myfx `kebabCase` 的 camelCase 分词（`Foo` → `foo`、`fooBar` → `foo-bar`）。
+ * 只用于「两个 prop 是否撞同一属性」的判定 —— 不需要与 myfx 在缩写词（`getMyURL`）上
+ * 逐字节一致，撞名关系的判定结果一致即可。
+ */
+function attrNameOf(name: string): string {
+  return name
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/[_\s]+/g, '-')
+    .toLowerCase()
+}
+
+/** CompElem 基类的公开方法 / 生命周期名（手工镜像 `F:\github\compelem\src\CompElem.ts`）。 */
+const COMPELEM_MEMBERS: ReadonlySet<string> = new Set([
+  'setup', 'propsReady', 'render', 'beforeMount', 'mounted', 'slotChange', 'afterUpdate',
+  'beforeDestroyed', 'destroyed', 'destroy', 'forceUpdate', 'updateProps', 'nextTick', 'emit',
+  'insertStyleSheet', 'getSubViewNodes', 'defineSignalField',
+  'connectedCallback', 'disconnectedCallback', 'attributeChangedCallback',
+])
+
+/** 运行期已无消费点的 field option（`shallow` / `hasChanged`：全仓 grep 零命中）。 */
+const DEAD_FIELD_OPTIONS = ['shallow', 'hasChanged'] as const
+
+/** 编辑距离是否恰好 ≤ 1（增/删/改一个字符）。 */
+function editDistanceLe1(a: string, b: string): boolean {
+  const la = a.length
+  const lb = b.length
+  if (Math.abs(la - lb) > 1) return false
+  let i = 0
+  while (i < la && i < lb && a[i] === b[i]) i++
+  if (la === lb) return i === la || a.slice(i + 1) === b.slice(i + 1)
+  return la > lb ? a.slice(i + 1) === b.slice(i) : a.slice(i) === b.slice(i + 1)
+}
+
+/** 与给定方法名只差一字符的基类成员（无则 null）。短名（<5）不参与，避免噪音。 */
+function nearestMemberName(name: string): string | null {
+  if (name.length < 5) return null
+  for (const m of COMPELEM_MEMBERS) {
+    if (m.length >= 5 && editDistanceLe1(name, m)) return m
+  }
+  return null
+}
+
+/** 全文件里该标识符出现的次数（含声明本身）。 */
+function countIdent(code: string, name: string): number {
+  const re = new RegExp(`(?<![\\w$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`, 'g')
+  let n = 0
+  while (re.exec(code)) n++
+  return n
+}
+
+/**
+ * W-FIELD-OPT-DEAD：`@prop` / `@state` 的 options 里出现了运行期没有消费点的键。
+ *
+ * 这类选项「写了不报错、也不生效」，比直接报错更难发现 —— 使用者会以为它在起作用。
+ * 只在 options 完全可静态展开（无 spread）时判断，否则可能误伤。
+ */
+function warnDeadOptions(
+  errs: ConventionError[],
+  entries: ReturnType<typeof flattenOptionProps>,
+  member: any,
+  memberName: string,
+  familyLabel: string,
+): void {
+  if (!entries.length || hasOpaqueOption(entries)) return
+  for (const key of DEAD_FIELD_OPTIONS) {
+    const opt = finalOption(entries, key)
+    if (!opt.known || !opt.node) continue
+    errs.push({
+      start: opt.node.start ?? member.start,
+      end: opt.node.end ?? member.end,
+      severity: 'warn',
+      message:
+        `W-FIELD-OPT-DEAD: ${familyLabel}('${memberName}') 的选项 '${key}' 运行期没有任何消费点` +
+        `（信号相等性恒为 Object.is）—— 该选项不会生效，可删除`,
+    })
+  }
 }
 
 /**
@@ -423,11 +628,18 @@ export function checkConventions(
   // 装饰器判定：按「本地名 → imported 名」精确解析（兼容 import { emits as e }）
   const isEmitsDec = (local: string) => comp.compelemImports.get(local) === 'emits'
   const isPropDec = (local: string) => comp.compelemImports.get(local) === 'prop'
+  const isStateDec = (local: string) => comp.compelemImports.get(local) === 'state'
   const isComputedDec = (local: string) => comp.compelemImports.get(local) === 'computed'
   const isCsscopeDec = (local: string) => comp.compelemImports.get(local) === 'csscope'
 
   // ---- 1. @emits 声明收集（含继承链） ----
-  const { declared, hasOpaque } = collectDeclaredEmits(cls, ctx, isEmitsDec, errs)
+  const { declared, hasOpaque } = collectDeclaredEmits(
+    cls,
+    ctx,
+    isEmitsDec,
+    (local) => comp.compelemImports.get(local) === 'CompElem',
+    errs,
+  )
 
   // ---- 2. 遍历类成员：emit 调用 / prop 赋值 / 装饰器目标检查 ----
   const propFields = new Map<string, any>() // name → PropertyDefinition 节点
@@ -436,6 +648,34 @@ export function checkConventions(
     if (!name || member.type !== 'PropertyDefinition') continue
     const decs: string[] = (member.decorators ?? []).map(decoratorName).filter(Boolean) as string[]
     if (decs.some((d) => isPropDec(d))) propFields.set(name, member)
+  }
+
+  /**
+   * E-PROP-ASSIGN 专用的**同文件继承链合并** prop 集：子类方法里对基类声明的
+   * prop 赋值，只查本类 propFields 会漏报。沿 extends 链上溯同文件基类
+   * （跨文件基类不可知，保持漏报不误报），浅替换语义——子类同名字段的选项
+   * 对象整体覆盖祖先（先放本类，祖先仅在无同名时补入）。
+   * ⚠️ 只用于 propAssignments 判定；成员级检查（E-PROP-CASE/TYPE 等）仍用
+   * 本类 propFields——那是按「本类成员自带 @prop」遍历的，混入祖先字段会
+   * 把子类同名的普通字段误当 prop 检查。
+   */
+  const propFieldsChain = new Map<string, any>(propFields)
+  {
+    const isCompElemBase = (name: string) => comp.compelemImports.get(name) === 'CompElem'
+    let cur = cls
+    for (let depth = 0; depth < 8; depth++) {
+      const sup = superClassName(cur)
+      if (!sup || isCompElemBase(sup)) break
+      const parent = ctx.localClasses.get(sup)
+      if (!parent) break // 基类在本文件外：其 prop 集不可知
+      for (const member of parent.body?.body ?? []) {
+        const name = keyName(member.key)
+        if (!name || member.type !== 'PropertyDefinition') continue
+        const decs: string[] = (member.decorators ?? []).map(decoratorName).filter(Boolean) as string[]
+        if (decs.some((d) => isPropDec(d)) && !propFieldsChain.has(name)) propFieldsChain.set(name, member)
+      }
+      cur = parent
+    }
   }
 
   for (const member of cls.body?.body ?? []) {
@@ -469,9 +709,28 @@ export function checkConventions(
     if (memberName) {
       const checkTarget = (importedName: string, allowed: string[]) => {
         // compelemImports 是 local→imported，需按 imported 值反查 local 名
-        const hasDec = [...comp.compelemImports.values()].includes(importedName) &&
-          decs.some((d) => comp.compelemImports.get(d) === importedName)
+        const hasDec = decs.some((d) => comp.compelemImports.get(d) === importedName)
         if (!hasDec) return
+        const isMethodDeco = importedName === 'debounced' || importedName === 'onced' || importedName === 'throttled'
+        if (isMethodDeco) {
+          // 方法装饰器只包装“非 static、非 private 的普通实例方法”；
+          // getter/static/private 会生成 `this.getter = …` / `this.#x_$__` 等坏代码。
+          const ok =
+            member.type === 'MethodDefinition' &&
+            member.kind === 'method' &&
+            member.static !== true &&
+            !String(memberName).startsWith('#')
+          if (!ok) {
+            errs.push({
+              start: member.start,
+              end: member.end,
+              message:
+                `E-DECO-TARGET: @${importedName} 只能用于非 static、非 private 的普通实例方法（'${memberName}' 是 ` +
+                `${member.static ? 'static ' : ''}${String(memberName).startsWith('#') ? 'private ' : ''}${member.kind ?? member.type}）`,
+            })
+          }
+          return
+        }
         let actual = 'unknown'
         if (member.type === 'MethodDefinition') actual = 'METHOD'
         else if (member.type === 'PropertyDefinition') actual = 'FIELD'
@@ -493,19 +752,98 @@ export function checkConventions(
     // @prop 约定
     if (memberName && propFields.has(memberName)) {
       if (!/^[a-z]/.test(memberName)) {
-        errs.push({
-          start: member.start,
-          end: member.end,
-          message: `E-PROP-CASE: Prop '${memberName}' 必须是 lowerCamelCase`,
-        })
+        // 运行期把 prop 名按 kebabCase 映射成 HTML 属性（utils.ts `_observedAttrs`）：
+        // `Foo` → `foo`，`this.Foo` 访问器与属性通道都照常工作 ⇒ 大写开头**本身不是语法错误**，
+        // 只有与另一个 prop 撞同一个属性名（`Foo` + `foo`）时才会真的互相覆盖。
+        const attr = attrNameOf(memberName)
+        const clash = [...propFields.keys()].find(
+          (n) => n !== memberName && attrNameOf(n) === attr,
+        )
+        if (clash) {
+          errs.push({
+            start: member.start,
+            end: member.end,
+            message:
+              `E-PROP-CASE: Prop '${memberName}' 与 '${clash}' 会映射到同一个 HTML 属性 '${attr}'` +
+              `（运行期 kebabCase 归一）——两者互相覆盖，请改用 lowerCamelCase 区分`,
+          })
+        } else {
+          errs.push({
+            start: member.start,
+            end: member.end,
+            severity: 'warn',
+            message:
+              `W-PROP-CASE: Prop '${memberName}' 不是 lowerCamelCase —— 运行期按 kebabCase 映射为属性 '${attr}'，` +
+              `功能正常，仅提示统一风格`,
+          })
+        }
       }
-      const opts = decoratorOptionsNode(member, 'prop', isPropDec, ctx)
+      const opts = decoratorOptionsNode(member, isPropDec, ctx)
+      const entries = opts ? flattenOptionProps(opts, ctx) : []
+      const typeOpt = finalOption(entries, 'type')
       const hasInit = member.value != null // PropertyDefinition 的初始化表达式
-      if (!hasInit && !(opts && (opts.properties ?? []).some((p: any) => keyName(p.key) === 'type'))) {
+      if (!hasInit && !typeOpt.known && !hasOpaqueOption(entries)) {
         errs.push({
           start: member.start,
           end: member.end,
           message: `E-PROP-TYPE: Prop '${memberName}' 没有默认值也没有声明 type，运行时无法做类型推断`,
+        })
+      }
+      // W-PROP-CUSTOM-CTOR：type 含内置以外的构造器、又没配 converter 且属性通道未关时，
+      // 属性字符串会以「原始字符串作单参」传给 new Ctor(...)。合法但易踩坑，提示级。
+      if (typeOpt.known && typeOpt.node && !hasOpaqueOption(entries)) {
+        const convOpt = finalOption(entries, 'converter')
+        const attrOpt = finalOption(entries, 'attribute')
+        const attrOff =
+          attrOpt.known &&
+          ((attrOpt.node?.type === 'Literal' && attrOpt.node.value === false) ||
+            attrOpt.node?.type === 'BooleanLiteral' && attrOpt.node?.value === false)
+        if (!convOpt.known && !attrOff) {
+          const custom = customCtorTypeNames(typeOpt.node)
+          if (custom.length) {
+            errs.push({
+              start: typeOpt.node.start,
+              end: typeOpt.node.end,
+              severity: 'warn',
+              message:
+                `W-PROP-CUSTOM-CTOR: Prop '${memberName}' 声明了自定义构造器 [${custom.join(', ')}]：` +
+                `HTML 属性反序列化会把原始字符串作单参传给 new ${custom[0]}(...)；` +
+                `如需其它解析请配 converter，或 attribute:false 关闭属性通道`,
+            })
+          }
+        }
+      }
+      // W-FIELD-OPT-DEAD：运行期已无消费点的选项（全仓 grep 零命中）——留着会让人误以为生效。
+      warnDeadOptions(errs, entries, member, memberName, '@prop')
+    }
+
+    // @state 约定：只关心 options（成员合法性由 field-extract 全量校验）
+    if (memberName && decs.some((d) => isStateDec(d))) {
+      const opts = decoratorOptionsNode(member, isStateDec, ctx)
+      const entries = opts ? flattenOptionProps(opts, ctx) : []
+      warnDeadOptions(errs, entries, member, memberName, '@state')
+    }
+
+    // ---- W-LIFECYCLE-TYPO：与基类生命周期只差一字符、且全文件无人引用的方法 ----
+    // 拼错的生命周期方法运行期永不调用（基类空实现，不报错），是最难查的一类静默失效。
+    // 「全文件无人引用」是关键的降噪条件：真正的工具方法（renderTo / mountedAll）一定被调。
+    if (
+      memberName &&
+      member.type === 'MethodDefinition' &&
+      member.kind === 'method' &&
+      !member.static &&
+      !COMPELEM_MEMBERS.has(memberName) &&
+      ctx.code
+    ) {
+      const near = nearestMemberName(memberName)
+      if (near && countIdent(ctx.code, memberName) <= 1) {
+        errs.push({
+          start: member.start,
+          end: member.end,
+          severity: 'warn',
+          message:
+            `W-LIFECYCLE-TYPO: '${memberName}' 与基类方法 '${near}' 只差一个字符，且本文件内没有任何引用 —— ` +
+            `运行期不会调用它；若不是拼写错误请忽略本条`,
         })
       }
     }
@@ -514,6 +852,8 @@ export function checkConventions(
     const fn =
       member.type === 'MethodDefinition' || member.type === 'PropertyDefinition' ? member.value : null
     if (!fn || (fn.type !== 'FunctionExpression' && fn.type !== 'ArrowFunctionExpression')) continue
+    // static 成员里的 this 是类本身，不是组件实例；emit/propAssign 规则不适用。
+    if (member.static) continue
 
     const usage = collectThisUsage(fn, ctx.code)
     for (const { arg } of usage.emitCalls) {
@@ -546,11 +886,25 @@ export function checkConventions(
       }
     }
     for (const { node, propName } of usage.propAssignments) {
-      const field = propFields.get(propName)
+      // 沿同文件继承链查（含基类 prop）；model 选项解析用的字段节点即声明处
+      const field = propFieldsChain.get(propName)
       if (!field) continue
-      // model:true 的 prop 运行时开放 set 通道（双向绑定），允许组件内赋值
-      const opts = decoratorOptionsNode(field, 'prop', isPropDec, ctx)
-      if (objectHasTrueProp(opts, 'model')) continue
+      // model:true 的 prop 运行时开放 set 通道（双向绑定），允许组件内赋值。
+      // spread 无法解析时不能证明“非 model”，跳过以免误报；已知 model:false 才报。
+      const opts = decoratorOptionsNode(field, isPropDec, ctx)
+      const entries = opts ? flattenOptionProps(opts, ctx) : []
+      const modelOpt = finalOption(entries, 'model')
+      if (modelOpt.known) {
+        const v = modelOpt.node
+        const isBool =
+          v?.type === 'BooleanLiteral' || (v?.type === 'Literal' && typeof v.value === 'boolean')
+        if (!isBool) continue // 值不可静态判定 → 宁漏勿误报
+        if (v.value === true) continue
+      } else if (hasOpaqueOption(entries)) continue
+      // E-PROP-ASSIGN 是**单向数据流约定**，不是运行时约束：注入的 setter 会直接写信号
+      // （`set x(__v) { this.__s.x.value = __v }`），`model` prop 更是开放写回的。
+      // 之所以在编译期拦，是因为「子组件悄悄改父组件传入值」在反应式链路里必然出现
+      // 双源真相；写法上应改用 model 或 updateProps 让改动走事件回到父端。
       errs.push({
         start: node.start,
         end: node.end,

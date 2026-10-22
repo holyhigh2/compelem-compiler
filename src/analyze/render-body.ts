@@ -13,7 +13,7 @@
  *     - 指令的**模板回调体**（`a` / `b` / `tmplFn`）→ 子视图（per-UpdatePoint）
  */
 import type { ComponentAnalysis } from '../types'
-import { isFreeIdentifierRef, keyName } from '../utils/oxc'
+import { addDepPath, collectPatternNames, isFreeIdentifierRef, keyName } from '../utils/ast'
 import { KNOWN_GLOBALS } from '../utils/globals'
 import {
   collectIssuesInSubtree,
@@ -49,7 +49,7 @@ interface ScanCtx {
   subKey: number
   /** 遇到的阻断原因（D 系列：静态分析无法保证正确性） */
   blockers: string[]
-  /** 已访问节点，防止 oxc 节点上的意外回指造成无限递归 */
+  /** 已访问节点，防止 AST 节点上的意外回指造成无限递归 */
   seen: WeakSet<object>
   /**
    * 当前词法作用域内已绑定的标识符（形参、局部变量、模块级声明）。
@@ -72,17 +72,14 @@ interface ScanCtx {
  * 从**最外层** MemberExpression 出发向内回溯；返回 `['a','b','c']`，
  * 非 this 起始或含 computed 访问时返回 null。
  *
- * 统一实现在 utils/oxc#thisChain。
+ * 统一实现在 utils/ast#thisChain。
  */
-import { thisChain } from '../utils/oxc'
+import { thisChain } from '../utils/ast'
 
 /** 记录一条依赖到当前作用域。 */
 function record(ctx: ScanCtx, path: string[]) {
   const target = ctx.inSub ? (ctx.subDeps.get(ctx.subKey) ?? new Set<string>()) : ctx.mainDeps
-  const full = path.join('.')
-  target.add(full)
-  // 根对象也推入（Proxy get 会把中间层路径推入）
-  if (path.length > 1) target.add(path[0])
+  addDepPath(target, path)
   if (ctx.inSub) ctx.subDeps.set(ctx.subKey, target)
 }
 
@@ -100,33 +97,8 @@ function collectParams(fn: any, into: Set<string>) {
   for (const p of fn.params ?? []) collectPatternNames(p, into)
 }
 
-/** 收集解构/简单绑定模式里的所有标识符名。 */
-function collectPatternNames(pat: any, into: Set<string>) {
-  if (!pat) return
-  switch (pat.type) {
-    case 'Identifier':
-      into.add(pat.name)
-      break
-    case 'ObjectPattern':
-      for (const prop of pat.properties ?? []) {
-        if (prop.type === 'RestElement') collectPatternNames(prop.argument, into)
-        else collectPatternNames(prop.value ?? prop.key, into)
-      }
-      break
-    case 'ArrayPattern':
-      for (const el of pat.elements ?? []) collectPatternNames(el, into)
-      break
-    case 'AssignmentPattern':
-      collectPatternNames(pat.left, into)
-      break
-    case 'RestElement':
-      collectPatternNames(pat.argument, into)
-      break
-    case 'TSParameterProperty':
-      collectPatternNames(pat.parameter, into)
-      break
-  }
-}
+/** 解构/简单绑定模式的标识符名收集统一在 utils/ast#collectPatternNames（本文件曾是唯一处理
+ *  TSParameterProperty 的那份副本，现已收敛）。 */
 
 /**
  * U5：函数参数子树的 D7 扫描。
@@ -188,7 +160,7 @@ function withBound<T>(ctx: ScanCtx, extra: Iterable<string>, fn: () => T): T {
 
 function scanNode(ctx: ScanCtx, node: any, parent: any) {
   if (!node || typeof node !== 'object' || typeof node.type !== 'string') return
-  // 防环：oxc 节点可能带非枚举回指；同时避免同一子树被重复扫描
+  // 防环：AST 节点可能带非枚举回指；同时避免同一子树被重复扫描
   if (!ctx.seen) ctx.seen = new WeakSet<object>()
   if (ctx.seen.has(node)) return
   ctx.seen.add(node)

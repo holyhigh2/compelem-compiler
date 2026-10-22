@@ -25,10 +25,13 @@
  * - varIndex 为 upm 序。
  */
 import { COMpelem_DIRECTIVES } from '../analyze/render-body'
-import type { TemplateVarInfo } from '../analyze/template-extract'
+import { normalizeAttrName } from './attr-name'
+import { varsByUpIndex, type TemplateVarInfo } from '../analyze/template-extract'
 import {
   PLACEHOLDER,
+  PLACEHOLDER_ONLY_RE,
   SVG_NS,
+  WS_SENSITIVE_TAGS,
   parseTemplateTree,
   splitParts,
   TemplateParseError,
@@ -39,9 +42,9 @@ import {
   type TVarPart,
 } from '../analyze/template-tree'
 import { camelCase, kebabCase, snakeCase } from 'myfx'
+import { isCustomTag, stringify } from '../utils/ast'
 import { canUseInnerHTML, serializeTemplateHTML } from './template-html'
 
-const J = JSON.stringify
 const BUILTIN_DIRECTIVES = COMpelem_DIRECTIVES
 
 export interface CodegenOptions {
@@ -64,7 +67,6 @@ export interface CodegenResult {
   mode?: 'create' | 'html'
 }
 
-const NAME_TOKEN_RE = new RegExp(`^${PLACEHOLDER}(\\d+)$`)
 
 /** 生成的 UpdatePoint 描述符（与运行时 UpdatePointMeta 字段同构）。 */
 export interface UpOut {
@@ -127,6 +129,8 @@ interface Ctx {
    * `upmMap[nodeSn]` 查表，也免去对整棵克隆树 collectNodes 回扫。
    */
   needed: Set<number>
+  /** var.index（模板序）→ varIndex（ups 序）；由 varsByUpIndex 建，见 Ctx 初始化 */
+  upIndexOf: Map<number, number>
 }
 
 function err(ctx: Ctx, msg: string) {
@@ -159,6 +163,9 @@ export function generateBuildTemplate(
     return { code: null, errors: fragRes.errors.map((m) => `[${opts.className}] ${m}`) }
   }
   const html = !opts.forceCreate && canUseInnerHTML(root)
+  const upsVars = varsByUpIndex(vars)
+  const upIndexOf = new Map<number, number>()
+  for (let i = 0; i < upsVars.length; i++) upIndexOf.set(upsVars[i].index, i)
   const ctx: Ctx = {
     L: [],
     nodeSn: 0,
@@ -173,11 +180,29 @@ export function generateBuildTemplate(
     html,
     paths: new Map(),
     needed: new Set(),
+    upIndexOf,
   }
 
   const rootPath: number[] = []
   const rootSib = { i: 0 }
   for (const nd of root) emitNode(ctx, nd, 'f', rootPath, rootSib)
+
+  // 不变式自检：**每个非片段 var 恰好产生一个 up，且 varIndex ≡ ups 下标**。
+  // 这条是 compile.ts / build-vars 取值表达式的对齐依据（varIndex 空间 = ups 序）；
+  // 一旦被打破，varIndex 会解到别的 var 上（取值错 + 读不到信号），故此处直接报错，
+  // 不让错位流到产物里。
+  // 已经有具体 codegen 错误时不再追加“不变量自检”噪声（例如属性位误用指令）。
+  if (!ctx.errors.length) {
+    if (ctx.varIndex !== ctx.ups.length || ctx.ups.some((u, i) => u.varIndex !== i)) {
+      ctx.errors.push(
+        `[${opts.className}] varIndex 空间错位（varIndex 计数 ${ctx.varIndex} / ups ${ctx.ups.length}）`,
+      )
+    } else if (upsVars.length !== ctx.ups.length) {
+      ctx.errors.push(
+        `[${opts.className}] 插值槽与更新点数量不一致（插值 ${upsVars.length} / 更新点 ${ctx.ups.length}）`,
+      )
+    }
+  }
 
   if (ctx.errors.length) return { code: null, errors: ctx.errors }
 
@@ -199,7 +224,7 @@ export function generateBuildTemplate(
     ? `function() {
   const d = document;
   const t = d.createElement('template');
-  t.innerHTML = ${J(serializeTemplateHTML(root))};
+  t.innerHTML = ${stringify(serializeTemplateHTML(root))};
   const f = t.content;
   const ee = {};
   const nodes = [];
@@ -233,9 +258,16 @@ const WALK_LINES: string[] = ['this._ceWalkSplit(f, nodes);']
 
 // ---------- 节点发射 ----------
 
-function emitNode(ctx: Ctx, nd: TNode, parentVar: string, parentPath: number[], sib: { i: number }) {
+function emitNode(
+  ctx: Ctx,
+  nd: TNode,
+  parentVar: string,
+  parentPath: number[],
+  sib: { i: number },
+  parentTag?: string,
+) {
   if (nd.type === 'element') emitElement(ctx, nd, parentVar, parentPath, sib)
-  else if (nd.type === 'text') emitText(ctx, nd, parentVar, parentPath, sib)
+  else if (nd.type === 'text') emitText(ctx, nd, parentVar, parentPath, sib, parentTag)
   else emitComment(ctx, nd, parentVar, parentPath, sib)
 }
 
@@ -331,7 +363,7 @@ function emitComment(ctx: Ctx, nd: { type: 'comment'; text: string }, parentVar:
   sib.i++
   // html 模式：注释已序列化进 HTML 串，无需创建行（parentVar 未用）
   if (ctx.html) return
-  ctx.L.push(`${parentVar}.appendChild(d.createComment(${J(nd.text)}));`)
+  ctx.L.push(`${parentVar}.appendChild(d.createComment(${stringify(nd.text)}));`)
 }
 
 function emitElement(ctx: Ctx, el: TElement, parentVar: string, parentPath: number[], sib: { i: number }) {
@@ -343,18 +375,20 @@ function emitElement(ctx: Ctx, el: TElement, parentVar: string, parentPath: numb
   ctx.paths.set(sn, myPath)
 
   // isCompElemNode 判定先于属性处理 → CompElem 自身的属性 up 也带 slotNodeSn（=自身 nodeSn）
-  const isComp = ctx.opts.knownTags.has(el.tag.toLowerCase())
+  // C3：自定义元素名恒含 `-`——跨包标签（本文件 knownTags 未登记但运行时已注册）的
+  // 子插值同样是 slot 内容，slotStack 必须 push，否则其内 `${slot(...)}` 锚不到本节点、
+  // 与 template-rules 的 slot 位判定不一致（跨包 E-DIRECTIVE-SCOPE 误报即源于此）。
+  const isComp = isCustomTag(el.tag.toLowerCase(), ctx.opts.knownTags)
   if (isComp) ctx.slotStack.push(sn)
-  // B：CompElem / <slot> 需在渲染期注册 wrapper / 绑定插槽 —— 即使该节点没有任何 up。
-  // 自定义元素名必含 `-`（customElements.define 的硬约束），故 `-` 判定独立于 knownTags，
-  // 覆盖「未被编译器登记但运行时已注册」的跨包标签；多余命中由运行时的 isCompElemNode 过滤。
-  if (isComp || el.tag.indexOf('-') >= 0 || el.tag.toLowerCase() === 'slot') ctx.needed.add(sn)
+  // B：CompElem / `<slot>` / 跨包自定义元素需在渲染期注册 wrapper / 绑定插槽 ——
+  // 即使该节点没有任何 up；多余命中由运行时的 isCompElemNode 过滤。
+  if (isComp) ctx.needed.add(sn)
 
   const childSib = { i: 0 }
   if (ctx.html) {
     // 元素已在 HTML 串中：只走编号/属性 up 收集，不发射创建与 append 行
     for (const a of el.attrs) emitAttr(ctx, el, a, sn, '')
-    for (const c of el.children) emitNode(ctx, c, parentVar, myPath, childSib)
+    for (const c of el.children) emitNode(ctx, c, parentVar, myPath, childSib, el.tag.toLowerCase())
     if (isComp) ctx.slotStack.pop()
     return
   }
@@ -362,8 +396,8 @@ function emitElement(ctx: Ctx, el: TElement, parentVar: string, parentPath: numb
   const v = `n${ctx.tmp++}`
   const create =
     el.ns === 'svg'
-      ? `d.createElementNS(${J(SVG_NS)}, ${J(el.tag)})`
-      : `d.createElement(${J(el.tag)})`
+      ? `d.createElementNS(${stringify(SVG_NS)}, ${stringify(el.tag)})`
+      : `d.createElement(${stringify(el.tag)})`
   ctx.L.push(`const ${v} = ${create};`)
   ctx.L.push(`nodes.push(${v});`)
 
@@ -371,11 +405,18 @@ function emitElement(ctx: Ctx, el: TElement, parentVar: string, parentPath: numb
 
   ctx.L.push(`${parentVar}.appendChild(${v});`)
 
-  for (const c of el.children) emitNode(ctx, c, v, myPath, childSib)
+  for (const c of el.children) emitNode(ctx, c, v, myPath, childSib, el.tag.toLowerCase())
   if (isComp) ctx.slotStack.pop()
 }
 
-function emitText(ctx: Ctx, nd: { type: 'text'; raw: string; parts: any[] }, parentVar: string, parentPath: number[], sib: { i: number }) {
+function emitText(
+  ctx: Ctx,
+  nd: { type: 'text'; raw: string; parts: any[] },
+  parentVar: string,
+  parentPath: number[],
+  sib: { i: number },
+  parentTag?: string,
+) {
   const hasVar = nd.parts.some((p: any) => p.type === 'var')
 
   // 无插值：原样保留（含纯空白；parts<2 → 原样保留但占号）
@@ -385,7 +426,7 @@ function emitText(ctx: Ctx, nd: { type: 'text'; raw: string; parts: any[] }, par
     ctx.paths.set(sn, parentPath.concat(sib.i++))
     if (ctx.html) return
     const v = `n${ctx.tmp++}`
-    ctx.L.push(`const ${v} = d.createTextNode(${J(nd.raw)});`)
+    ctx.L.push(`const ${v} = d.createTextNode(${stringify(nd.raw)});`)
     ctx.L.push(`nodes.push(${v});`)
     ctx.L.push(`${parentVar}.appendChild(${v});`)
     return
@@ -393,19 +434,31 @@ function emitText(ctx: Ctx, nd: { type: 'text'; raw: string; parts: any[] }, par
 
   // 有插值：整体 trim 后分裂（静态片段 trim、空白片段丢弃、占位符为空文本节点）。
   // 每个分段占一个 childNodes 位；分段数与运行时 walkSplitText 严格一致（见 canUseInnerHTML 契约）。
-  const whole = nd.raw.trim()
+  //
+  // ⚠️ rawtext 系 / `<pre>` 下**不能 trim**（2026-10-22 审查 C-7）：那里的空白与换行
+  // 就是内容本身。此前无条件 trim ⇒ `h`<pre>\n  line1\n  ${n}\n  line3\n</pre>`` 的
+  // 缩进换行全丢（产物只剩 "line1" / "" / "line3"），而 parse 阶段的 prune 明写
+  // "rawtext 系空白是真内容、一律不动" —— 两个阶段口径必须一致。
+  const preserveWs = !!parentTag && WS_SENSITIVE_TAGS.has(parentTag)
+  let whole = preserveWs ? nd.raw : nd.raw.trim()
+  if (preserveWs) {
+    // HTML 解析器在 <pre>/<textarea> 起始标签后会吃掉**一个**换行；
+    // create 路径没有解析器，这里手动对齐，保证两条建树路径产物一致。
+    if (whole.startsWith('\r\n')) whole = whole.slice(2)
+    else if (whole.startsWith('\n')) whole = whole.slice(1)
+  }
   const parts = splitParts(whole)
 
   for (const p of parts) {
     if (p.type === 'static') {
-      const t = p.text.trim()
+      const t = preserveWs ? p.text : p.text.trim()
       if (!t) continue
       const sn = ctx.nodeSn++
       ctx.nodeNames.push('#text')
       ctx.paths.set(sn, parentPath.concat(sib.i++))
       if (ctx.html) continue
       const v = `n${ctx.tmp++}`
-      ctx.L.push(`const ${v} = d.createTextNode(${J(t)});`)
+      ctx.L.push(`const ${v} = d.createTextNode(${stringify(t)});`)
       ctx.L.push(`nodes.push(${v});`)
       ctx.L.push(`${parentVar}.appendChild(${v});`)
       continue
@@ -445,7 +498,7 @@ function emitAttr(ctx: Ctx, el: TElement, a: TAttr, sn: number, elVar: string) {
   const vps = varPartsOf(a)
 
   // 1. 标签位指令（属性名整体为占位符）
-  const tok = NAME_TOKEN_RE.exec(name)
+  const tok = PLACEHOLDER_ONLY_RE.exec(name)
   if (tok) {
     const info = ctx.vars[+tok[1]]
     if (!info) { err(ctx, `插值槽 #${tok[1]} 未声明`); return }
@@ -490,7 +543,7 @@ function emitAttr(ctx: Ctx, el: TElement, a: TAttr, sn: number, elVar: string) {
     if (vps.length === 0) {
       if ((a.value ?? '').trim() === '') {
         const ev = lowerName(ctx, el, name.slice(1))
-        ctx.L.push(`(${eeGet(ctx, sn)}).push(${J(ev)});`)
+        ctx.L.push(`(${eeGet(ctx, sn)}).push(${stringify(ev)});`)
         return
       }
       err(ctx, `事件 ${name} 的静态值会被丢弃（legacy 行为），请绑定函数`)
@@ -528,15 +581,18 @@ function emitAttr(ctx: Ctx, el: TElement, a: TAttr, sn: number, elVar: string) {
     const up: UpOut = { varIndex: ctx.varIndex++, nodeSn: sn }
     if (ctx.slotStack.length) up.slotNodeSn = ctx.slotStack[ctx.slotStack.length - 1]
     if (name[0] === '.') {
-      // prop：目标必须是已注册 CompElem（或 <slot>）
-      if (!ctx.opts.knownTags.has(el.tag.toLowerCase()) && el.tag.toLowerCase() !== 'slot') {
+      // prop：目标必须是已注册 CompElem / `<slot>` / 跨包自定义元素。
+      // C3：与 B 段共用 isCustomTag——knownTags 只有编译器登记过的标签，跨包自定义元素
+      // （运行期才 define）不在表内，但合法自定义元素名必含 `-`（customElements.define
+      // 硬约束），多余命中由运行期 isCompElemNode 过滤兜底。
+      if (!isCustomTag(el.tag.toLowerCase(), ctx.opts.knownTags)) {
         err(ctx, `Prop ${name} 只能设置在 CompElem 或 <slot> 上（<${el.tag}> 未注册）`)
       }
       up.isProp = true
       up.attrName = name.slice(1)
     } else if (name[0] === '?') {
       up.isToggleProp = true
-      up.attrName = lowerName(ctx, el, name.slice(1))
+      up.attrName = normalizeAttrName(el.ns, name.slice(1), el.tag.toLowerCase(), ctx.opts.knownTags)
     } else if (name[0] === '*') {
       // refAttr：*name[:camel|:kebab|:snake]
       const spec = lowerName(ctx, el, name.slice(1))
@@ -551,10 +607,12 @@ function emitAttr(ctx: Ctx, el: TElement, a: TAttr, sn: number, elVar: string) {
       up.isRefAttr = true
       up.attrName = converted
     } else {
-      up.attrName = lowerName(ctx, el, name)
+      up.attrName = normalizeAttrName(el.ns, name, el.tag.toLowerCase(), ctx.opts.knownTags)
       up.attrTmpl = attrTmplOf(a)
-      // isPureTmpl：value === PLACEHOLDER + varIndex（upm 序严格相等）
-      up.isPureTmpl = a.parts.length === 1 && vps[0].index === up.varIndex
+      // isPureTmpl：value === PLACEHOLDER + varIndex（upm 序严格相等）。
+      // ⚠️ 比较的是 var 的**ups 序**下标，不是 `vps[0].index`（模板序）：
+      // 片段 var（`${html(CONST)}`）不占 varIndex，两序会错开。
+      up.isPureTmpl = a.parts.length === 1 && ctx.upIndexOf.get(vps[0].index) === up.varIndex
     }
     pushUp(ctx, up)
     return
@@ -571,7 +629,7 @@ function emitAttr(ctx: Ctx, el: TElement, a: TAttr, sn: number, elVar: string) {
   }
   // html 模式：静态属性已序列化进 HTML 串（不产生创建期 setAttribute 行）
   if (ctx.html) return
-  ctx.L.push(`${elVar}.setAttribute(${J(el.ns === 'html' ? name.toLowerCase() : name)}, ${J(a.value ?? '')});`)
+  ctx.L.push(`${elVar}.setAttribute(${stringify(normalizeAttrName(el.ns, name, el.tag.toLowerCase(), ctx.opts.knownTags))}, ${stringify(a.value ?? '')});`)
 }
 
 function eeGet(ctx: Ctx, sn: number): string {
@@ -623,6 +681,6 @@ function serializeUp(up: UpOut, idx: number): string {
       if (k === 'varIndex') return up.varIndex !== idx
       return true
     })
-    .map(([k, v]) => `${k}: ${typeof v === 'number' ? v : J(v)}`)
+    .map(([k, v]) => `${k}: ${typeof v === 'number' ? v : stringify(v)}`)
   return `{ ${fields.join(', ')} }`
 }

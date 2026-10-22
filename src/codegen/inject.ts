@@ -9,6 +9,7 @@
 import MagicString from 'magic-string'
 import type { ComponentAnalysis } from '../types'
 import { DEBUG_DIV } from '../types'
+import { IDENT_RE, unwrapExpr } from '../utils/ast'
 
 export interface InjectOptions {
   /** 无视图组件标记：注入 noView: true（不创建 Shadow DOM）*/
@@ -31,8 +32,6 @@ export interface StaticLiteralCodes {
   inlinedWatchAncestors?: boolean
   /** cssVars effect 工厂（读 CSS 依赖信号 → 更新自定义属性） */
   cssEffect?: string
-  /** 结构指令元数据占位字段，运行时从不读取（分派参数在 pointEffects 内） */
-  dirMeta?: string
   buildTemplate?: string
   /** 子视图表（结构指令的子模板元数据）：`subViews: { <subId>: { buildTemplate, fx } }` */
   subViews?: string
@@ -55,12 +54,44 @@ export interface CtorInsertPlan {
   pos: number
   /** true = 类无构造体 → 合成 `constructor(...__a){ super(...__a); ... }` */
   synthesize: boolean
+  /**
+   * 警告级诊断（W 通道）：super(…) 不在构造体顶层语句位时给出——
+   * 插入点只能退到构造体末尾，prop/state 初始值写入晚于分支内用户语句，
+   * 与原生字段初始化时机不严格等价。调用方转成 severity:'warn' 诊断。
+   */
+  warn?: string
+}
+
+/**
+ * 构造体内**非顶层**位置（分支/try/循环/带标签语句）是否存在 super(…) 调用。
+ * 不下钻嵌套函数/类：其中的 `super()` 要么非法（嵌套函数）、要么属于嵌套类自己的构造器。
+ */
+function hasNestedSuperCall(node: any): boolean {
+  if (!node || typeof node !== 'object') return false
+  if (Array.isArray(node)) return node.some(hasNestedSuperCall)
+  if (typeof node.type !== 'string') return false
+  if (node.type === 'CallExpression' && node.callee?.type === 'Super') return true
+  if (
+    node.type === 'FunctionDeclaration' ||
+    node.type === 'FunctionExpression' ||
+    node.type === 'ArrowFunctionExpression' ||
+    node.type === 'ClassDeclaration' ||
+    node.type === 'ClassExpression'
+  ) {
+    return false
+  }
+  for (const key of Object.keys(node)) {
+    if (key === 'type' || key === 'loc' || key === 'parent' || key === 'start' || key === 'end') continue
+    if (hasNestedSuperCall(node[key])) return true
+  }
+  return false
 }
 
 /**
  * 计算 prop/state 初始值写入的构造体插入点。
  * 与原字段初始化时机等价：super() 返回后、构造体其余语句之前；
- * 顶层无 super 语句（嵌套形态）时退到构造体末尾（闭合 `}` 前，保证执行且在 super 后）。
+ * super 语句不在顶层（分支/try 内）时退到构造体末尾（闭合 `}` 前，保证执行且在
+ * super 后），并给出 warn 级诊断说明时序取舍。
  */
 export function planCtorInsert(
   comp: ComponentAnalysis,
@@ -79,14 +110,29 @@ export function planCtorInsert(
     (m: any) => m.type === 'MethodDefinition' && m.kind === 'constructor',
   )
   if (!ctor) return { pos: braceIdx + 1, synthesize: true }
-  const stmts = ctor.value?.body?.body ?? []
+  const body = ctor.value?.body
+  const stmts = body?.body ?? []
+  // 顶层 super(…) 语句按 **AST** 判定：`super (…)` 带空格、`(super(…))` 带括号、
+  // TS 包装形态都能命中（旧文本判据 `code.startsWith('super(')` 全部漏掉，
+  // 初始值写入被静默推到构造体末尾、晚于用户语句）
   for (const st of stmts) {
-    if (st.type === 'ExpressionStatement' && code.startsWith('super(', st.start)) {
+    if (st.type !== 'ExpressionStatement') continue
+    const e = unwrapExpr(st.expression)
+    if (e?.type === 'CallExpression' && e.callee?.type === 'Super') {
       return { pos: st.end, synthesize: false }
     }
   }
-  const body = ctor.value?.body
   if (!body) return undefined
+  if (hasNestedSuperCall(body)) {
+    return {
+      pos: body.end - 1,
+      synthesize: false,
+      warn:
+        `W-CTOR-SUPER: 组件 '${comp.className}' 构造器的 super(…) 位于分支/嵌套结构内，` +
+        `prop/state 初始值写入已退到构造体末尾（保证在 super 后执行，但晚于构造体内的用户语句，` +
+        `与原生字段初始化时机不严格等价）；如需严格时序请把 super(…) 移回构造体顶层语句位`,
+    }
+  }
   return { pos: body.end - 1, synthesize: false }
 }
 
@@ -94,12 +140,20 @@ export function planCtorInsert(
 export interface ImportInjectOptions {
   /** 需要导入的运行时函数名（已定名，含可能的 __ce_ 别名） */
   helpers?: string[]
+  /**
+   * helper 的本地名 → 原始导出名。仅当本地名与导出名不同（冲突别名）时需要；
+   * 缺省按同名导入。例如 `{ __ce_signal: 'signal' }` →
+   * `import { signal as __ce_signal } from 'compelem'`。
+   */
+  helperAliases?: Record<string, string>
   /** 定位到的 compelem import 声明：有命名 specifier 则原位扩展，否则新增独立行 */
   helperImport?: { decl: any; source: string }
   /** 新增独立 import 行时的锚点（首个 import 起点或首语句起点） */
   helpersAnchor?: number
   /** 需要从 **myfx** 注入的运行时函数名（方法装饰器前移的 debounce/throttle/once） */
   myfxHelpers?: string[]
+  /** myfx helper 的本地名 → 原始导出名（同 helperAliases） */
+  myfxAliases?: Record<string, string>
   /** 定位到的 myfx import 声明：有命名 specifier 则原位扩展，否则新增独立行 */
   myfxImport?: { decl: any; source: string }
   /**
@@ -109,6 +163,8 @@ export interface ImportInjectOptions {
   topLevel?: string
   /** topLevel 的插入锚点（紧跟其后的偏移） */
   topLevelAnchor?: number
+  /** inline 预变换的原始坐标编辑；在 class 注入前统一 overwrite。 */
+  inlineEdits?: Array<{ start: number; end: number; text: string }>
 }
 
 /**
@@ -150,15 +206,7 @@ export function emitFamily(name: 'props' | 'states' | 'computedGetters', ownCode
  * `watchEffects` 的 emit 形态 —— **数组拼接**语义（props/states 是浅替换，语义相反）。
  *
  * @watch effect 是**要执行的行为**而非可替换的表：子类 own 数组必须把祖先的执行
- * 序列接在**自己前面**，而不是覆盖掉它。
- *
- * ⚠️ own `__ce_static__` 会**遮蔽**父类整个静态对象，漏 emit 即丢祖先全部 @watch。
- * 实测（compelem-ui，2026-10）：`Input → BaseInput → ControlBox → FormControl →
- * AppearanceElem` 每层都跨文件，`AppearanceElem` 的 5 个 immediate watch 全部未执行 ——
- * 其中 `__watchSRB` 正是把 `--border-size` / `--round-size` / `--shadow-size`
- * 写上宿主 inline style 的那个。`ce-input` 宿主因此没有 `--border-size`，
- * `form/input/input.scss` 的 `border-width: var(--border-size)` 在 computed-value
- * time 无效 → 回退到 initial 值 `medium` = 3px 边框。
+ * 序列接在**自己前面**，而不是覆盖掉它
  *
  * @param ownCode 本类 @watch 生成的数组字面量（`[...]`）；无则 undefined
  * @param inlinedAncestors `entries` 是否已内联**同文件**基类的 @watch。
@@ -217,7 +265,7 @@ export function buildStaticLiteral(
     parts.push(mark('cssEffect', `cssEffect: ${codes.cssEffect}`))
   }
 
-if (codes.pointEffects) {
+  if (codes.pointEffects) {
     // per-point effect 工厂数组：
     // 每个工厂 (rc, nodes) => effectFn，订阅一个信号，取值 → 守卫 → 写 DOM 在微任务里。
     parts.push(mark('pointEffects', `pointEffects: ${codes.pointEffects}`))
@@ -270,6 +318,13 @@ export function injectInto(
   const s = new MagicString(code)
   const injected: string[] = []
   const additions: string[] = []
+  const removalSpans = edits.flatMap((e) => e.removals ?? [])
+  // inline 预变换与 class 注入共用同一个 MagicString（原始源码坐标），这样 map
+  // 直接指回用户源码；落在 remove 区间里的 inline 编辑是死代码，跳过以免区间重叠。
+  for (const e of extras.inlineEdits ?? []) {
+    if (removalSpans.some((r) => e.start < r.end && r.start < e.end)) continue
+    s.overwrite(e.start, e.end, e.text)
+  }
 
   const sorted = [...edits].sort((a, b) => b.comp.start - a.comp.start)
   for (const { comp, literal, removals, fieldInits, ctor, methodDecoCtor, methodDecoDestroy } of sorted) {
@@ -296,12 +351,12 @@ export function injectInto(
     if ((hasFieldInits || methodDecoCtor) && ctor) {
       const inits = hasFieldInits
         ? fieldInits!
-            .map((i) =>
-              i.computed
-                ? `this.__s.${i.name} = signalComputed(function()${i.initText}.bind(this));`
-                : `this.__s.${i.name} = signal(${i.initText});`,
-            )
-            .join(' ')
+          .map((i) =>
+            i.computed
+              ? `this.__s.${i.name} = signalComputed(function()${i.initText}.bind(this));`
+              : `this.__s.${i.name} = signal(${i.initText});`,
+          )
+          .join(' ')
         : ''
       const md = methodDecoCtor ? (inits ? ' ' : '') + methodDecoCtor : ''
       const stmts = inits + md
@@ -343,32 +398,54 @@ export function injectInto(
   // 仅 default/namespace/无 compelem import 时新增独立行（锚点=首 import 或首语句前）
   const injectHelperImport = (
     namesIn: string[] | undefined,
+    aliases: Record<string, string> | undefined,
     importDecl: { decl: any; source: string } | undefined,
     anchor: number | undefined,
     fallbackSource: string,
   ) => {
-    const names = [...new Set((namesIn ?? []).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n)))]
-    if (!names.length) return
+    // local → imported。local 是生成代码里实际使用的名字；imported 是包的导出名。
+    const specs = new Map<string, string>()
+    for (const local of namesIn ?? []) {
+      const imported = aliases?.[local] ?? local
+      if (!IDENT_RE.test(local)) continue
+      if (!IDENT_RE.test(imported)) continue
+      specs.set(local, imported)
+    }
+    if (!specs.size) return
+
     const decl = importDecl?.decl
-    const hasNamed = !!decl && (decl.specifiers ?? []).some((sp: any) => sp.type === 'ImportSpecifier')
+    // `import type { … }` 是纯类型声明，绝不能把运行时 helper 追加进去。
+    const isTypeOnly = decl?.importKind === 'type'
+    const hasNamed =
+      !isTypeOnly &&
+      !!decl &&
+      (decl.specifiers ?? []).some((sp: any) => sp.type === 'ImportSpecifier')
+    const existing = new Set<string>(
+      (decl?.specifiers ?? []).map((sp: any) => sp.local?.name).filter(Boolean),
+    )
+    const pending = [...specs].filter(([local]) => !existing.has(local))
+    if (!pending.length) return
+    const specText = pending
+      .map(([local, imported]) => (local === imported ? local : `${imported} as ${local}`))
+      .join(', ')
     const braceIdx = decl ? code.lastIndexOf('}', decl.end) : -1
     if (decl && hasNamed && braceIdx > decl.start) {
       // 源码 `}` 前已是尾逗号（多行命名导入风格）→ 只补空格，否则 `, ,` 双逗号语法错误
       const needComma = !/,\s*$/.test(code.slice(decl.start, braceIdx))
-      const text = (needComma ? ', ' : ' ') + names.join(', ')
+      const text = (needComma ? ', ' : ' ') + specText
       s.appendLeft(braceIdx, text)
       additions.push(text)
     } else {
       const at = anchor ?? 0
-      const text = `import { ${names.join(', ')} } from ${JSON.stringify(importDecl?.source ?? fallbackSource)};\n`
+      const text = `import { ${specText} } from ${JSON.stringify(importDecl?.source ?? fallbackSource)};\n`
       s.appendLeft(at, text)
       additions.push(text)
     }
   }
-  injectHelperImport(extras.helpers, extras.helperImport, extras.helpersAnchor, 'compelem')
+  injectHelperImport(extras.helpers, extras.helperAliases, extras.helperImport, extras.helpersAnchor, 'compelem')
   // 方法装饰器前移注入的 `debounce/throttle/once` 是 **myfx** 的实现，不是 compelem 的
   // 出口 —— 走独立的 myfx 通道：优先扩展源码已有的 `from "myfx"` 命名导入。
-  injectHelperImport(extras.myfxHelpers, extras.myfxImport, extras.helpersAnchor, 'myfx')
+  injectHelperImport(extras.myfxHelpers, extras.myfxAliases, extras.myfxImport, extras.helpersAnchor, 'myfx')
 
   // 模块级常量（子模板 carrier 等）：插在最后一个 import 之后。
   // 与 class 体内注入同批记入 additions —— 「removals 还原源码」的字节恒等校验

@@ -94,10 +94,6 @@ export type ReactiveKind = 'prop' | 'state' | 'computed'
 export interface ReactiveField {
   name: string
   kind: ReactiveKind
-  /** 静态初始化器里的默认值表达式源码（用于静态取值内联），无则 undefined */
-  init?: string
-  /** 是否为深层对象（init 是对象/数组字面量），影响依赖路径展开 */
-  shallow: boolean
 }
 
 /** 一个组件的完整静态分析结果。 */
@@ -125,7 +121,7 @@ export interface ComponentAnalysis {
   bodyStart: number
   /** `@tag` 名称，无则 undefined */
   tagName?: string
-  /** 响应式字段（含继承链上收集到的，按声明顺序） */
+  /** 本类自身声明的响应式字段（按声明顺序；继承链由依赖提取另行上溯） */
   fields: Map<string, ReactiveField>
   /** 本类自身定义的实例方法名（D2：自有方法值不可变，不推入依赖，无需拒绝） */
   ownMethods: Set<string>
@@ -187,7 +183,8 @@ export interface ComponentAnalysis {
 /** 插件选项。 */
 export interface CompilerOptions {
   /**
-   * 参与编译的文件过滤。默认只处理 `.ts` 且源码里出现 `extends CompElem` 的文件。
+   * 参与编译的文件过滤。默认处理 `.ts`，且源码里出现 `extends CompElem`、`@tag(`
+   * 或家族装饰器（@prop/@state/@computed/@query）之一。
    * ⚠️ 不要放宽到 `.js`：IIFE 打包产物里指令名不在 scope，会触发 D3 误报。
    */
   include?: (id: string, code: string) => boolean

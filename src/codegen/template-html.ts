@@ -15,7 +15,8 @@
  * - nodeSn：walk 按文档序（元素先入列再入子）编号，与 codegen 的
  *   emitElement/emitText 序号严格一致——这是回退判定保守的根本原因。
  */
-import { PLACEHOLDER, VOID_TAGS, type TAttr, type TElement, type TNode } from '../analyze/template-tree'
+import { PLACEHOLDER_FIRST_RE, VOID_TAGS, type TAttr, type TElement, type TNode } from '../analyze/template-tree'
+import { normalizeAttrName } from './attr-name'
 
 /** HTML 树构造会重构/搬迁/丢弃的标签——出现即回退 createElement 路径。 */
 const HARD_UNSAFE = new Set([
@@ -54,11 +55,8 @@ const SELECT_CHILDREN_OK = new Set(['option', 'optgroup', 'hr', 'script'])
 
 const H_SET = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
 
-const TOKEN_RE = new RegExp(`${PLACEHOLDER}(\\d+)`)
-
 function hasVar(s: string): boolean {
-  TOKEN_RE.lastIndex = 0
-  return TOKEN_RE.test(s)
+  return PLACEHOLDER_FIRST_RE.test(s)
 }
 
 /**
@@ -231,7 +229,11 @@ function serElement(el: TElement): string {
   let attrs = ''
   for (const a of el.attrs) {
     if (!seriableAttr(a)) continue
-    attrs += a.value == null ? ` ${a.name}` : ` ${a.name}="${escAttr(a.value)}"`
+    // 与 createElement 路径同规则归一属性名（camelCase → kebab，svg 保留），
+    // 否则 innerHTML 解析器小写化会把驼峰名变成既不匹配 prop 观测、也不匹配
+    // createElement 路径产物的第三种形态
+    const name = normalizeAttrName(el.ns, a.name, el.tag.toLowerCase())
+    attrs += a.value == null ? ` ${name}` : ` ${name}="${escAttr(a.value)}"`
   }
   const open = `<${el.tag}${attrs}>`
   if (VOID_TAGS.has(el.tag.toLowerCase())) return open
