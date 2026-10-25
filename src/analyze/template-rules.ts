@@ -3,6 +3,7 @@
  *
  * 编译期覆盖以下约定检查：
  *   E-PROP-INTERP   .prop 的值必须是插值
+ *   E-DIRECTIVE-DUP  同一元素上同一种指令只允许出现一次
  *   E-MUTATE-MODIFIER  @mutate 必须带 attr/child/char/tree 类型修饰符
  *   E-EVENT-FN      事件处理器必须是函数/成员
  *   E-EVENT-MODIFIER  非键盘事件上出现了不会生效的修饰符（运行期会被当成按键名过滤）
@@ -472,6 +473,28 @@ export function checkTemplateRules(
   }
 
   for (const el of elements) {
+    // ---- E-DIRECTIVE-DUP：同一元素上同一种指令只允许出现一次 ----
+    // 运行期按指令名收集 var，重复时后者直接覆盖前者且不报错，表现为「写了两个只有一个生效」。
+    // TAG 位指令写成属性名整插值（`<div ${show(a)} ${show(b)}>`），在 TAttr.name 里是 ⟬Ċ⟭N 占位符。
+    const seenDirectives = new Set<string>()
+    for (const a of el.attrs) {
+      if (!a.name.includes('⟬')) continue
+      const dm = /⟬Ċ⟭(\d+)/.exec(a.name)
+      if (!dm) continue
+      const dv = tmpl.vars[+dm[1]]
+      if (!dv?.isDirectiveCall || !dv.directiveName) continue // 自定义指令 → 放行
+      if (seenDirectives.has(dv.directiveName)) {
+        errs.push({
+          ...pos,
+          message:
+            `E-DIRECTIVE-DUP: 元素 <${el.tag}> 上的指令 '${dv.directiveName}' 出现了两次以上；` +
+            `同一元素每种指令只能写一次（重复的那份运行期会被静默丢弃）`,
+        })
+      } else {
+        seenDirectives.add(dv.directiveName)
+      }
+    }
+
     for (const a of el.attrs) {
       // 属性名整体插值 = TAG 指令写法，不属于以下任何检查
       if (a.name.includes('⟬')) continue

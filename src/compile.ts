@@ -1281,3 +1281,24 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
 }
 
 export { analyzeFile, analyzeRender, assertStaticAnalysis }
+
+/**
+ * 编译**已确定要编译**的源码，跳过 `include` 判定。
+ *
+ * 与 {@link compileFile} 的分工：
+ * - `compileFile` 面向「磁盘上可能是组件、也可能不是」的输入，先按扩展名 +
+ *   特征做 include 判定；
+ * - `compileSource` 面向「调用方已经决定要编译」的输入 —— 典型是 SFC 插件把
+ *   `.ce` 分段拼成的虚拟 TypeScript 模块。虚拟模块的 id 仍是 `.ce`（为了
+ *   sourcemap 指向真实文件），天然过不了 `defaultInclude` 的扩展名检查，
+ *   以前只能传 `include: () => true` 绕过整个判定（连 node_modules 排除也一起绕过）。
+ *
+ * `options.include` 在这里被忽略。
+ */
+export function compileSource(
+  code: string,
+  id: string,
+  options: CompilerOptions = {},
+): CompileResult {
+  return compileFile(code, id, { ...options, include: () => true })
+}

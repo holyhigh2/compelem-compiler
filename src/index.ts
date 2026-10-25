@@ -8,8 +8,19 @@ export { assertStaticAnalysis, StaticAnalysisError } from './analyze/static-gate
 export { analyzeRender } from './analyze/render-body'
 export type { RenderAnalysis } from './analyze/render-body'
 export { buildStaticLiteral, injectInto } from './codegen/inject'
-export { compileFile, defaultInclude } from './compile'
+export { compileFile, compileSource, defaultInclude } from './compile'
 export type { CompileResult, DepSummary } from './compile'
+export {
+  collectDiagnostics,
+  newlineIndex,
+  offsetToLineCol,
+  relativeToRoot,
+  reportConventionDiagnostics,
+  reportDiagnostics,
+} from './diagnostics'
+export type { CollectedDiagnostics, ConventionMode } from './diagnostics'
+export { DEFAULT_TAG_EXT, TAG_RE, scanKnownTags } from './tag-registry'
+export type { ScanKnownTagsOptions } from './tag-registry'
 export { DEBUG_DIV } from './types'
 export type {
   CompiledStatic,

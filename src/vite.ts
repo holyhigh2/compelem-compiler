@@ -10,9 +10,10 @@
  * 通过 `enforce: 'pre'` + `transform` 钩子工作：在 TS→JS 转换之前拿到 `.ts` 源码，
  * 注入 `static __ce_static__` 后交回后续插件链。
  */
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { compileFile } from './compile'
+import { collectDiagnostics, reportConventionDiagnostics, type ConventionMode } from './diagnostics'
+import { TAG_RE, scanKnownTags } from './tag-registry'
 import type { CompilerOptions } from './types'
 import { hash32 } from './utils/ast'
 
@@ -24,8 +25,6 @@ interface MinimalPlugin {
   configResolved?: (config: any) => void
   buildStart?: (this: any) => void | Promise<void>
 }
-
-const TAG_RE = /@tag\(\s*['"]([^'"]+)['"]/g
 
 /**
  * 用于 transform 缓存键的按文件指纹（见 tagFingerprint）。
@@ -44,36 +43,6 @@ function tagFingerprint(usedTags: Set<string>, knownTags: Set<string>): string {
   return hash32(inter.join('\n'))
 }
 
-const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'out', 'coverage'])
-
-/** 递归收集 root 下 .ts/.tsx 的 @tag 名（跨文件标签注册表，TEMPLATE-CODEGEN.md §4）。 */
-function scanKnownTags(root: string, out: Set<string>, depth = 0): void {
-  if (depth > 20) return
-  let entries
-  try {
-    entries = readdirSync(root, { withFileTypes: true })
-  } catch {
-    return
-  }
-  for (const e of entries) {
-    if (e.name.startsWith('.')) continue
-    if (e.isDirectory()) {
-      if (SKIP_DIRS.has(e.name)) continue
-      scanKnownTags(join(root, e.name), out, depth + 1)
-    } else if (/\.tsx?$/.test(e.name) && !e.name.endsWith('.d.ts')) {
-      try {
-        const code = readFileSync(join(root, e.name), 'utf-8')
-        if (code.indexOf('@tag') < 0 && code.indexOf('CompElem') < 0) continue
-        TAG_RE.lastIndex = 0
-        let m
-        while ((m = TAG_RE.exec(code))) out.add(m[1].toLowerCase())
-      } catch {
-        /* 忽略读失败 */
-      }
-    }
-  }
-}
-
 export interface VitePluginOptions extends CompilerOptions {
   /** 是否输出每个文件的编译诊断 */
   verbose?: boolean
@@ -90,75 +59,6 @@ export interface VitePluginOptions extends CompilerOptions {
    */
   emitJs?: boolean
   debugSourceMap?: boolean
-}
-
-/** 惰性构建换行偏移索引（升序；仅在有诊断时付费一次）。 */
-function newlineIndex(code: string): Int32Array {
-  const arr: number[] = []
-  for (let i = 0; i < code.length; i++) if (code.charCodeAt(i) === 10) arr.push(i)
-  return Int32Array.from(arr)
-}
-
-/** 把源码偏移换算成 `行:列`（1 起算）；带换行索引时走二分（O(log n)）。 */
-function offsetToLineCol(code: string, offset: number, nl?: Int32Array): string {
-  if (!nl) {
-    let line = 1
-    let lastNl = -1
-    for (let i = 0; i < offset && i < code.length; i++) {
-      if (code.charCodeAt(i) === 10) {
-        line++
-        lastNl = i
-      }
-    }
-    return `${line}:${offset - lastNl}`
-  }
-  //二分：count = 换行下标中严格小于 offset 的个数
-  let lo = 0, hi = nl.length
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1
-    if (nl[mid] < offset) lo = mid + 1
-    else hi = mid
-  }
-  const lastNl = lo > 0 ? nl[lo - 1] : -1
-  return `${lo + 1}:${offset - lastNl}`
-}
-
-/**
- * 从 diagnostics 收集**约定诊断**为可上报文本，按 severity 分为 errs（E-*）与 warns（W-*）
- */
-function collectErrors(
-  res: ReturnType<typeof compileFile>,
-  code: string,
-  id: string,
-  root: string,
-): { errs: string[]; warns: string[] } {
-  const errs: string[] = []
-  const warns: string[] = []
-  const rel = id.startsWith(root) ? id.replace(/\\/g, '/').slice(root.replace(/\\/g, '/').length + 1) : id
-  let nl: Int32Array | undefined
-  for (const d of res.diagnostics) {
-    const list = d.conventionErrors?.map((e) => ({ offset: e.start, message: e.message, severity: e.severity })) ?? []
-    for (const e of list) {
-      nl ??= newlineIndex(code)
-      const at = offsetToLineCol(code, e.offset, nl)
-      const line = `${rel}:${at} [${d.className}] ${e.message}`
-        ; (e.severity === 'warn' ? warns : errs).push(line)
-    }
-  }
-  return { errs, warns }
-}
-
-/** 按 mode 上报违规（error 阻断构建 / warn 控制台 / silent 忽略）。 */
-function reportErrors(msgs: string[], mode: 'warn' | 'error' | 'silent', head: string, thisArg: any) {
-  if (mode === 'silent' || !msgs.length) return
-  const text = head + '\n  ' + msgs.join('\n  ')
-  if (mode === 'error') {
-    const err = thisArg?.error?.bind(thisArg)
-    if (err) err(new Error(text))
-    else throw new Error(text)
-  } else {
-    console.warn(text)
-  }
 }
 
 /** compelem 编译期优化插件。 */
@@ -229,9 +129,7 @@ export function compelemCompiler(options: VitePluginOptions = {}): MinimalPlugin
       // 约定错误：独立于静态分析闸门，默认直接阻断构建；
       // W 码（severity:'warn'，如 W-PROP-CUSTOM-CTOR）恒为控制台提示，不随档位阻断。
       if (convMode !== 'silent') {
-        const { errs, warns } = collectErrors(res, code, id, root)
-        if (warns.length) console.warn(`[compelem/compiler] ${warns.length} 条提示：\n  ` + warns.join('\n  '))
-        reportErrors(errs, convMode, `[compelem/compiler] 检测到 ${errs.length} 处约定错误：`, this)
+        reportConventionDiagnostics(collectDiagnostics(res, code, id, root), convMode, this)
       }
 
       if (!res.changed) return null
