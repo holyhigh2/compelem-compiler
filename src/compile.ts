@@ -5,6 +5,7 @@ import { analyzeFile, collectLocalClasses, collectModuleBindings, isCompelemSour
 import { checkConventions, collectModuleConsts, collectModuleFunctions, collectStringConsts } from './analyze/conventions'
 import { extractComputedDeps, extractCssDeps } from './analyze/deps-extract'
 import { extractFieldAccessors, RUNTIME_HELPERS } from './analyze/field-extract'
+import { extractResources } from './analyze/resource-extract'
 import { inlineTemplateMethodsWithEdits, type Edit as InlineEdit } from './analyze/inline-template-methods'
 import { extractMethodDecos } from './analyze/method-deco-extract'
 import { analyzeRender } from './analyze/render-body'
@@ -495,16 +496,27 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
     conventionErrors.push(...mdRes.errors)
     const mdHelpers = mdRes.runtimeHelpers.map((n) => helperBindings[n] ?? n)
 
+    // @resource 前移：装饰器只做标注，loader 搬成 `__rl_<name>`、派生访问器注入类体、
+    // 纯数据选项进 `__ce_static__.resources`。运行时 `resource()` 是空壳（同 @state）。
+    const resRes = extractResources(comp, code, convCtx)
+    conventionErrors.push(...resRes.errors)
+    const resHelpers = resRes.runtimeHelpers.map((n) => helperBindings[n] ?? n)
+
     const allRemovals: Array<{ start: number; end: number }> = [
       ...watchRemovals,
       ...fieldRes.removals,
       ...mdRes.removals,
+      ...resRes.removals,
     ]
     const fieldCodes = {
       props: fieldRes.propsCode,
       states: fieldRes.statesCode,
       computedGetters: fieldRes.computedCode,
-      accessors: fieldRes.accessors || undefined,
+      resources: resRes.resourcesCode,
+      // @resource 注入的 `__rl_` / `__rs_` 方法**不参与** field-extract 的祖先去重：
+      // 那个机制剔除的是「子类重复声明同名 prop/state 只为覆盖默认值」时的逐字节相同访问器行；
+      // resource 的 loader 若被剔除，子类自己的资源就没了（父子各有各的实例）。
+      accessors: (fieldRes.accessors + resRes.accessors) || undefined,
     }
     // prop/state 初始值构造写入 + 访问器所需运行时函数（并集供文件级 import 注入）
     const needCtor = fieldRes.fieldInits.length > 0 || !!mdRes.ctorStmts
@@ -531,7 +543,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       // → 产物 emit 了 `wText(...)` 却没有 import → 运行期 ReferenceError。
       // getter 在 `...fieldExtras` 展开（即 edits.push）时才求值，那时 codegen 已完成。
       get helpers() {
-        const all = [...fieldHelpers, ...writers]
+        const all = [...fieldHelpers, ...resHelpers, ...writers]
         return all.length ? [...new Set(all)] : undefined
       },
       // 方法装饰器前移要的是 **myfx** 的 debounce/throttle/once —— 走 myfx 通道，
@@ -622,21 +634,24 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       // 家族字段则相反 —— 必须逐张表浅替换叠加，见 inject.ts emitFamily。
       const hasOwnField =
         !!fieldRes.accessors ||
+        !!resRes.accessors ||
         fieldRes.propsCode !== undefined ||
         fieldRes.statesCode !== undefined ||
         fieldRes.computedCode !== undefined ||
+        resRes.resourcesCode !== undefined ||
         // 只有 cssVars 覆写、没有其他家族成员的中间类也必须注入自己的 cssEffect
         !!cssEffectCode
       if (hasOwnField || watchEffectsCode) {
-        // super 表达式改由 emitFamily 内部的 `Reflect.getPrototypeOf(this)` 解析：
-        // 原先 `code.slice(superNode.start, superNode.end)` 重放 extends 子句源码，
-        // 遇到 `extends Mixin(CompElem)` 会**二次调用 mixin 工厂**取到另一个类。
+        // super 表达式由 emitFamily 内部的 `Reflect.getPrototypeOf(this)` 解析，
+        // 不用 `code.slice(...)` 重放 extends 源码：后者遇到 `extends Mixin(CompElem)`
+        // 会二次调用 mixin 工厂，取到另一个类。
         const mk = (label: string, body: string) => `${DEBUG_DIV} ${label}\n${body}`
         const parts = [
           mk('inherits', `...Reflect.getPrototypeOf(this).__ce_static__`),
           mk('props', `props: ${emitFamily('props', fieldRes.propsCode)}`),
           mk('states', `states: ${emitFamily('states', fieldRes.statesCode)}`),
           mk('computedGetters', `computedGetters: ${emitFamily('computedGetters', fieldRes.computedCode)}`),
+          mk('resources', `resources: ${emitFamily('resources', resRes.resourcesCode)}`),
         ]
         // watchEffects 必须注入：@watch 装饰器已随 watchRemovals 被删，不注入即彻底丢失。
         // 语义是**拼接**不是覆盖 —— own 数组把父类那份接在前面（ancestors-first），
@@ -650,7 +665,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
         edits.push({
           comp,
           literal:
-            `static __ce_static__ = {\n${parts.join(',\n')}\n};\n` + (fieldRes.accessors || ''),
+            `static __ce_static__ = {\n${parts.join(',\n')}\n};\n` + (fieldRes.accessors + resRes.accessors || ''),
           removals: allRemovals,
           ...fieldExtras,
         })

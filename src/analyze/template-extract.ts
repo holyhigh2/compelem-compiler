@@ -165,8 +165,7 @@ export function staticHtmlFragmentOf(e: any, comp: ComponentAnalysis): string | 
  * 非 this 起始 / 含 computed 访问时返回 null。
  *
  * 统一实现在 utils/ast#thisChain（属性名走 keyName，`#private` 带 `#` 前缀，
- * 与 render-body 侧对齐 —— 本副本原先手写分支漏了前缀，会把 `this.#x` 与
- * `this.x` 混成同一个依赖键）。
+ * 否则 `this.#x` 与 `this.x` 会混成同一个依赖键）。
  */
 
 /**

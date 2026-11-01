@@ -42,6 +42,13 @@ export interface StaticLiteralCodes {
   states?: string
   /** `__ce_static__.computedGetters` 字面量值（@computed 前移，原 getter 体外提） */
   computedGetters?: string
+  /**
+   * `__ce_static__.resources` 字面量值（@resource 前移）。
+   *
+   * 只放纯数据选项（timeout/immediate/track + source 的布尔标记）；
+   * loader 与 source 函数搬成类上的 `__rl_<name>` / `__rs_<name>` 私有方法。
+   */
+  resources?: string
   /** 类体访问器源码（prop/state/computed 的 get/set + `@tag` 类的 observedAttributes），
    *  接在 static 字面量之后注入。无 `@tag` 的类不带 observedAttributes —— 它们永不被
    *  `customElements.define`，浏览器不会读它们的表。 */
@@ -182,7 +189,7 @@ export interface ImportInjectOptions {
 const SUPER_STATIC = 'Reflect.getPrototypeOf(this).__ce_static__'
 
 /** `superProps` 表达式：取父类（可能未编译 → undefined）的家族表。 */
-const superFamily = (name: 'props' | 'states' | 'computedGetters') => `${SUPER_STATIC}?.${name}`
+const superFamily = (name: 'props' | 'states' | 'computedGetters' | 'resources') => `${SUPER_STATIC}?.${name}`
 
 /**
  * 家族字段的 emit 形态 —— **浅替换**语义。
@@ -197,7 +204,7 @@ const superFamily = (name: 'props' | 'states' | 'computedGetters') => `${SUPER_S
  * 漏掉就会把祖先的 prop/state 定义一并遮没（这正是连续两层无自有 prop
  * 子类丢失整张定义表的根因）。
  */
-export function emitFamily(name: 'props' | 'states' | 'computedGetters', ownCode?: string): string {
+export function emitFamily(name: 'props' | 'states' | 'computedGetters' | 'resources', ownCode?: string): string {
   const sup = superFamily(name)
   return ownCode === undefined ? sup : `{ ...${sup}, ...${ownCode} }`
 }
@@ -247,6 +254,9 @@ export function buildStaticLiteral(
   parts.push(mark('props', `props: ${emitFamily('props', codes.props)}`))
   parts.push(mark('states', `states: ${emitFamily('states', codes.states)}`))
   parts.push(mark('computedGetters', `computedGetters: ${emitFamily('computedGetters', codes.computedGetters)}`))
+  // resources 与上三族同构（own 浅替换叠加父类表）：own 静态字面量会遮蔽父类整张表，
+  // 子类不 emit 就会把祖先的 @resource 定义一并遮没 —— 运行期 bindResource 读不到选项。
+  parts.push(mark('resources', `resources: ${emitFamily('resources', codes.resources)}`))
 
   // watchEffects 与 props/states 的 emit 形态**不同**：那边是浅替换，这边是拼接
   // （effect 是要执行的行为，own 数组必须把祖先的执行序列接在自己前面）。

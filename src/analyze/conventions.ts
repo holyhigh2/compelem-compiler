@@ -28,7 +28,7 @@
 import type { ComponentAnalysis } from '../types'
 // unwrapTsExpr 是 unwrapExpr 的历史名（field-extract / method-deco-extract /
 // template-rules / literal-meta 仍在用），在此转出以免改动那些 import 路径。
-// 本文件原先那份实现**不认** TSTypeAssertion（`<T>x`），已随统一修正。
+// 实现已统一到 utils/ast 的 unwrapExpr，认 TSTypeAssertion（`<T>x`）。
 import { decoratorName, keyName, superClassName, unwrapExpr } from '../utils/ast'
 export { decoratorName, unwrapExpr as unwrapTsExpr }
 

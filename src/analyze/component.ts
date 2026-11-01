@@ -187,17 +187,37 @@ function extractClassInfo(node: any, resolve: ImportResolver): ClassInfo {
       }
 
       // ---- 方法/getter 名（原 extractMembers） ----
+      // @resource 特殊：字段声明由编译器前移删除（`analyze/resource-extract.ts`），
+      // 运行期由 `CompElem` 按 `__ce_static__.resources` 在原型上装同名 getter，
+      // 所以这个成员在运行期是 **getter**，必须按 getter 归类。
+      // 否则 render-body 会把它当「自有字段值不可变」——既不记录依赖也不扫体，
+      // 模板里的 `this.<资源名>` 永远不更新（表现为请求照发、界面不动）。
+      const resDeco = (member.decorators ?? []).find((d: any) => {
+        const n = decoratorName(d)
+        return n ? resolve(n) === 'resource' : false
+      })
       if (member.type === 'MethodDefinition') {
-        if (member.kind === 'get') getters.add(name)
-        else methods.add(name)
-        const fn = member.value
-        if (fn?.body) bodies.set(name, fn.body)
-      } else if (member.type === 'PropertyDefinition') {
-        // 箭头函数字段也算方法
-        const init = member.value
-        if (init && (init.type === 'ArrowFunctionExpression' || init.type === 'FunctionExpression')) {
+        // 方法形态（旧 API）已移除，extraction 会报 E-RESOURCE；这里不做特殊归类。
+        if (member.kind === 'get') {
+          getters.add(name)
+          const fn = member.value
+          if (fn?.body) bodies.set(name, fn.body)
+        } else {
           methods.add(name)
-          if (init.body) bodies.set(name, init.body)
+          const fn = member.value
+          if (fn?.body) bodies.set(name, fn.body)
+        }
+      } else if (member.type === 'PropertyDefinition') {
+        if (resDeco) {
+          // 资源字段：运行期换成 getter，没有可扫的体（依赖靠求值时动态建链）
+          getters.add(name)
+        } else {
+          // 箭头函数字段也算方法
+          const init = member.value
+          if (init && (init.type === 'ArrowFunctionExpression' || init.type === 'FunctionExpression')) {
+            methods.add(name)
+            if (init.body) bodies.set(name, init.body)
+          }
         }
       }
     }

@@ -1,9 +1,8 @@
 /**
  * 约定诊断（E-* / W-*）的收集与上报。
  *
- * 抽成独立模块的原因：`.ts` 组件与 `.ce` 组件的约定校验必须共用同一份实现。
- * 之前 `collectErrors` 只存在于 `./vite`，而 sfc 插件只捕获 `StaticAnalysisError`
- * —— 同一段代码换个扩展名，就会从「阻断构建」退化成「静默通过」。
+ * 独立模块：`.ts` 组件与 `.ce` 组件的约定校验共用同一份实现，
+ * 由 `collectErrors` 统一产出 errs / warns 两组文本。
  */
 import type { CompileResult } from './compile'
 

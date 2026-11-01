@@ -88,7 +88,7 @@ export interface UpOut {
   isDirective?: boolean
   directiveType?: string
   /** 指令真名（forEach/ifTrue/show/...）。directiveType 只是锚点类型（text|slot），
-   *  不能用来判断指令种类——之前 render-effect 正是因此把所有结构指令都判成未知。 */
+   *  判断指令种类要用这个字段。 */
   directiveName?: string
   isProp?: boolean
   isToggleProp?: boolean

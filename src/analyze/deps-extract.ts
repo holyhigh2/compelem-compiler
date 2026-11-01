@@ -61,8 +61,8 @@ function record(ctx: ExtractCtx, path: string[]) {
   addDepPath(ctx.deps, path)
 }
 
-/** TS 包装节点解包（`this as any` / `that!` 等）—— 统一实现在 utils/ast#unwrapExpr。
- *  本副本原先比别处多认 `TSInstantiationExpression`、少认 `TSTypeAssertion`，已归一。 */
+/** TS 包装节点解包（`this as any` / `that!` / `<T>x` 等）—— 统一实现在 utils/ast#unwrapExpr，
+ *  认 TSInstantiationExpression 与 TSTypeAssertion。 */
 
 /** 置失败标记；DEPS_TRACE=1 时输出原因标签（见文件头）。 */
 function failAt(ctx: ExtractCtx, where: string) {
