@@ -440,8 +440,14 @@ export function injectInto(
       .join(', ')
     const braceIdx = decl ? code.lastIndexOf('}', decl.end) : -1
     if (decl && hasNamed && braceIdx > decl.start) {
-      // 源码 `}` 前已是尾逗号（多行命名导入风格）→ 只补空格，否则 `, ,` 双逗号语法错误
-      const needComma = !/,\s*$/.test(code.slice(decl.start, braceIdx))
+      // 源码 `}` 前已是尾逗号（多行命名导入风格）→ 只补空格，否则 `, ,` 双逗号语法错误。
+      // 判前先剥注释：`prop, // 说明\n}` 里行注释会让 `/,\s*$/` 失配 ⇒ 误判「无尾逗号」
+      // ⇒ 产物 `prop, // 说明\n, signal` 变成连续两个逗号。
+      const beforeBrace = code
+        .slice(decl.start, braceIdx)
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/[^\n]*/g, '')
+      const needComma = !/,\s*$/.test(beforeBrace)
       const text = (needComma ? ', ' : ' ') + specText
       s.appendLeft(braceIdx, text)
       additions.push(text)

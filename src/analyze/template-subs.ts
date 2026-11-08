@@ -21,6 +21,7 @@ import {
   TAG_ONLY_DIRECTIVES,
   TemplateExtractError,
   extractThisChainPaths,
+  preludeStatementError,
   staticHtmlFragmentOf,
   type TemplateVarInfo,
 } from './template-extract'
@@ -31,11 +32,7 @@ export class SubExtractError extends Error { }
 /** 指令实参分区：与 render-body 的 TEMPLATE_ARG_INDEX 同语义。 */
 export function partitionDirectiveArgs(directive: string, args: any[]): boolean[] {
   const tmplIdx = TEMPLATE_ARG_INDEX[directive]
-  return args.map((_, i) => {
-    if (tmplIdx === 'rest-after-0') return i >= 1
-    if (Array.isArray(tmplIdx)) return tmplIdx.includes(i)
-    return false
-  })
+  return args.map((_, i) => Array.isArray(tmplIdx) && tmplIdx.includes(i))
 }
 
 const FN_TYPES = new Set(['ArrowFunctionExpression', 'FunctionExpression'])
@@ -418,7 +415,29 @@ function findTemplateHits(ctx: CollectCtx, fn: any): any[] {
   return hits
 }
 
-function buildCandidate(ctx: CollectCtx, fn: any): SubCandidate {
+/**
+ * 回调自身作用域里会遮蔽模块级 `const` 的绑定名：形参 + 块体顶层声明。
+ *
+ * 子模板的插值在回调体内求值，同名形参 / 局部 const 优先于模块级声明；
+ * `html(CONST)` 折叠只按名字查 `moduleConstInits`，不查这层遮蔽就会把
+ * 局部值折成模块值。嵌套回调还要叠加**外层回调**的同名绑定（见 collectSubCandidates）。
+ */
+function callbackScopeNames(fn: any): Set<string> {
+  const out = new Set<string>()
+  for (const p of fn.params ?? []) collectPatternNames(p, out)
+  const body = fn.body
+  if (body?.type !== 'BlockStatement') return out
+  for (const s of body.body ?? []) {
+    if (s?.type === 'VariableDeclaration') {
+      for (const d of s.declarations ?? []) collectPatternNames(d.id, out)
+    } else if ((s?.type === 'FunctionDeclaration' || s?.type === 'ClassDeclaration') && s.id?.name) {
+      out.add(s.id.name)
+    }
+  }
+  return out
+}
+
+function buildCandidate(ctx: CollectCtx, fn: any, outerScope?: ReadonlySet<string>): SubCandidate {
   const body = fn.body
   const isBlock = body?.type === 'BlockStatement'
   let hit: any
@@ -467,13 +486,16 @@ function buildCandidate(ctx: CollectCtx, fn: any): SubCandidate {
       preludeStart = stmts[0].start
       preludeEnd = stmts[retIdx - 1].end
       preludeSrc = __source.slice(preludeStart, preludeEnd)
-      for (let si = 0; si < retIdx; si++) {
-        if (containsBlockedTsNode(stmts[si])) {
+      const preludeStmts = stmts.slice(0, retIdx)
+      for (const s of preludeStmts) {
+        if (containsBlockedTsNode(s)) {
           throw new SubExtractError(
-            blockedTsText(`子模板 @${fn.start} 的 prelude`, __source.slice(stmts[si].start, stmts[si].end)),
+            blockedTsText(`子模板 @${fn.start} 的 prelude`, __source.slice(s.start, s.end)),
           )
         }
       }
+      const stmtErr = preludeStatementError(preludeStmts, `子模板 @${fn.start} 的 prelude`)
+      if (stmtErr) throw new SubExtractError(stmtErr)
     }
   }
 
@@ -490,11 +512,14 @@ function buildCandidate(ctx: CollectCtx, fn: any): SubCandidate {
     return String(q.value.cooked)
   })
   const exprs: any[] = quasi.expressions ?? []
+  const cbScope = new Set<string>(outerScope ?? [])
+  for (const n of callbackScopeNames(fn)) cbScope.add(n)
   const vars: TemplateVarInfo[] = exprs.map((e: any, index: number) => {
     const exprSource = __source.slice(e.start, e.end).trim()
     // `${html(CONST)}` 静态 HTML 常量：与主模板同一套判据（staticHtmlFragmentOf）。
     // 子模板的取值同样走 generateSubBuildVars，跳过规则一致 ⇒ 参数/取值下标对齐。
-    const fragment = staticHtmlFragmentOf(e, ctx.comp)
+    // 第三个实参是本回调作用域的遮蔽名（形参 / 局部声明），否则会把局部值折成模块值。
+    const fragment = staticHtmlFragmentOf(e, ctx.comp, cbScope)
     let isDirectiveCallFlag = false
     let directiveName: string | undefined
     let moduleBindingName: string | undefined
@@ -573,8 +598,27 @@ export function collectSubCandidates(comp: ComponentAnalysis, source: string): S
     const nodes = [...ctx.candidates].sort(
       (a, b) => (a.start ?? 0) - (b.start ?? 0) || (b.end ?? 0) - (a.end ?? 0),
     )
+    // 回调自外向内嵌套：按 start 升序、end 降序排序后，前面的包含者即祖先。
+    // 祖先回调的形参 / 局部声明同样会遮蔽模块级 const（内层插值可能捕获它们），
+    // 折叠判据必须叠加这一层，否则内层会把外层局部值折成模块值。
+    const ancestorScope = new Map<number, Set<string>>()
+    for (let i = 0; i < nodes.length; i++) {
+      const scope = new Set<string>()
+      const child = nodes[i]
+      for (let j = 0; j < i; j++) {
+        const p = nodes[j]
+        if (
+          typeof p.start === 'number' && typeof p.end === 'number' &&
+          typeof child.start === 'number' && typeof child.end === 'number' &&
+          p.start <= child.start && child.end <= p.end
+        ) {
+          for (const n of callbackScopeNames(p)) scope.add(n)
+        }
+      }
+      ancestorScope.set(i, scope)
+    }
     return nodes.map((fn, i) => {
-      const cand = buildCandidate(ctx, fn)
+      const cand = buildCandidate(ctx, fn, ancestorScope.get(i))
       cand.subId = i
       return cand
     })

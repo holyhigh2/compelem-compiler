@@ -3,7 +3,7 @@
  */
 import type { ComponentAnalysis, ReactiveField, ReactiveKind } from '../types'
 import type { ParsedFile } from '../utils/ast'
-import { collectPatternNames, keyName, topLevelReturns } from '../utils/ast'
+import { collectPatternNames, keyName, topLevelReturns, unwrapExpr } from '../utils/ast'
 
 /** 判断某个 import source 是否指向 compelem 本体。 */
 export function isCompelemSource(source: string): boolean {
@@ -197,17 +197,26 @@ function extractClassInfo(node: any, resolve: ImportResolver): ClassInfo {
         return n ? resolve(n) === 'resource' : false
       })
       if (member.type === 'MethodDefinition') {
-        // 方法形态（旧 API）已移除，extraction 会报 E-RESOURCE；这里不做特殊归类。
-        if (member.kind === 'get') {
-          getters.add(name)
-          const fn = member.value
-          if (fn?.body) bodies.set(name, fn.body)
-        } else {
-          methods.add(name)
-          const fn = member.value
-          if (fn?.body) bodies.set(name, fn.body)
+        // 静态成员不是实例成员：`this.x` 读不到，依赖提取按名字内联扫体也会扫错对象。
+        if (!member.static) {
+          // 方法形态（旧 API）已移除，extraction 会报 E-RESOURCE；这里不做特殊归类。
+          if (member.kind === 'get' || member.kind === 'set') {
+            if (member.kind === 'get') getters.add(name)
+            // getter 与 setter 共用一个槽位，两者语句都要扫：
+            // `get tone()` 读 state、`set tone()` 写另一个字段时，只保留其一
+            // 会让依赖提取漏掉另一半读到的信号（cssVars 因此不重算）。
+            const fn = member.value
+            if (fn?.body) {
+              const prev = bodies.get(name)
+              bodies.set(name, prev ? mergeBodies(prev, fn.body) : fn.body)
+            }
+          } else {
+            methods.add(name)
+            const fn = member.value
+            if (fn?.body) bodies.set(name, fn.body)
+          }
         }
-      } else if (member.type === 'PropertyDefinition') {
+      } else if (member.type === 'PropertyDefinition' && !member.static) {
         if (resDeco) {
           // 资源字段：运行期换成 getter，没有可扫的体（依赖靠求值时动态建链）
           getters.add(name)
@@ -225,6 +234,7 @@ function extractClassInfo(node: any, resolve: ImportResolver): ClassInfo {
     // ---- render()（原 extractRenderBody；首个合法 render 胜出） ----
     if (
       !render &&
+      !member.static &&
       (member.type === 'MethodDefinition' || member.type === 'PropertyDefinition') &&
       keyName(member.key) === 'render'
     ) {
@@ -243,7 +253,7 @@ function extractClassInfo(node: any, resolve: ImportResolver): ClassInfo {
     }
 
     // ---- cssVars / @computed getter 体（原 extractDepBodies） ----
-    if (member.type === 'MethodDefinition' && name) {
+    if (member.type === 'MethodDefinition' && name && !member.static) {
       const fn = member.value
       if (fn && (fn.type === 'FunctionExpression' || fn.type === 'ArrowFunctionExpression')) {
         const body = fn.body
@@ -263,9 +273,61 @@ function extractClassInfo(node: any, resolve: ImportResolver): ClassInfo {
   return { fields, queryFields, methods, getters, bodies, render, renderInvalid, cssVarsBody: cssVars, computedBodies }
 }
 
+/**
+ * `@tag` 实参 → 标签名：字符串字面量 / 无插值模板 / 同文件 `const` 引用 /
+ * 同文件 `const` 对象的静态成员（`TAGS.App`、`TAGS['App']`）。
+ *
+ * 只解一层成员访问：对象本身必须是同文件 `const` 的对象字面量，属性值必须是字符串
+ * 字面量或无插值模板。更深的链（`A.B.C`）不做 —— 每多一层就要多一份「这真的是常量吗」
+ * 的论证，收益不抵风险。
+ *
+ * 跨文件导入的常量在单文件编译里没有值，返回 undefined —— 由 conventions 决定是否报错。
+ */
+function staticTagName(arg: any, consts: Map<string, any>): string | undefined {
+  const strOf = (n: any): string | undefined => {
+    if (!n) return undefined
+    const u = unwrapExpr(n)
+    if (!u) return undefined
+    if ((u.type === 'Literal' || u.type === 'StringLiteral') && typeof u.value === 'string') return u.value
+    if (u.type === 'TemplateLiteral' && (u.expressions ?? []).length === 0) {
+      return u.quasis?.[0]?.value?.cooked ?? undefined
+    }
+    return undefined
+  }
+  const direct = strOf(arg)
+  if (direct !== undefined) return direct
+  const node = unwrapExpr(arg)
+  if (node?.type === 'Identifier') return strOf(consts.get(node.name)?.init)
+  if (node?.type === 'MemberExpression') {
+    const obj = unwrapExpr(node.object)
+    if (obj?.type !== 'Identifier') return undefined
+    const key = node.computed ? strOf(node.property) : keyName(node.property)
+    if (!key) return undefined
+    const init = unwrapExpr(consts.get(obj.name)?.init)
+    if (init?.type !== 'ObjectExpression') return undefined
+    for (const p of init.properties ?? []) {
+      if (p.type !== 'Property' || p.computed) continue
+      if (keyName(p.key) !== key) continue
+      return strOf(p.value)
+    }
+  }
+  return undefined
+}
+
+/**
+ * 把两个函数体并成一个 BlockStatement，供依赖提取一次内联扫描。
+ *
+ * 用于 getter / setter 同名共存：两者语句都要扫，否则会丢掉其中一半读到的信号。
+ * `start/end` 取首尾两段的范围，仅用于错误定位。
+ */
+function mergeBodies(a: any, b: any): any {
+  const as = a.type === 'BlockStatement' ? (a.body ?? []) : [a]
+  const bs = b.type === 'BlockStatement' ? (b.body ?? []) : [b]
+  return { type: 'BlockStatement', body: [...as, ...bs], start: a.start, end: b.end }
+}
+
 /** U5：extractClassInfo 按 class 节点记忆（同文件祖先在依赖提取中被多组件复用）。 */
 const INFO_CACHE = new WeakMap<object, ClassInfo>()
-
 /** 取某 class 节点的 ClassInfo（WeakMap 记忆；resolve 为文件级常量，同文件命中安全）。 */
 export function classInfoOf(node: any, resolve: ImportResolver): ClassInfo {
   const hit = INFO_CACHE.get(node)
@@ -430,8 +492,9 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
     if (tagDec) {
       const e = tagDec.expression
       if (e?.type === 'CallExpression' && e.arguments?.[0]) {
-        const a = e.arguments[0]
-        if (a.type === 'Literal' || a.type === 'StringLiteral') tagName = String(a.value)
+        // 与 @emits 同口径：字面量之外还要认同文件 const（`@tag(TAG)`）。
+        // 无法解析时由 conventions 报 E-TAG-ARG，这里只需给出能解析的那部分。
+        tagName = staticTagName(e.arguments[0], moduleConstInits)
       }
     }
 
@@ -518,6 +581,7 @@ export function analyzeFile(code: string, id: string, parsed: ParsedFile): Compo
       end: cls.end,
       bodyStart: cls.body?.start ?? -1,
       tagName,
+      tagDecorated: !!tagDec,
       fields,
       queryFields,
       ownMethods: methods,

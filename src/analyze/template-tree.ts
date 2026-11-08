@@ -170,7 +170,9 @@ export function parseTemplateTree(
           err(`<${stack[stack.length - 1].name}> 未闭合（不支持 HTML 自动闭合，请显式书写结束标签）`)
         }
         const popped = stack.pop()!
-        if (popped.lower === 'svg') inSvg = false
+        // 闭合后是否仍在 SVG 上下文，取决于**栈里还剩几层** svg：嵌套 svg 的内层
+        // 结束后，外层后续子元素仍是 SVG 命名空间。只看 popped 会把它们误判成 HTML。
+        if (popped.lower === 'svg') inSvg = stack.some((s) => s.lower === 'svg')
         i += m![0].length
         continue
       }

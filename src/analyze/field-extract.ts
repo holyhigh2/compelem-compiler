@@ -219,12 +219,15 @@ export function extractFieldAccessors(
    * 「只有 @tag、没有五族成员」时仍要注入的那部分：`observedAttributes` getter。
    *
    * 与函数末尾的 emit 走同一个生成器，保证两条路径产物完全一致。
-   * 条件只看 `comp.tagName`，**不看自有 prop** —— 自有 prop 一个都没有的 @tag 类
-   * （属性整张来自无 @tag 基类）同样必须带这个 getter，否则浏览器注册它时读到的
-   * observedAttributes 是 undefined，attribute 驱动全部静默失效。
+   * 条件只看 `comp.tagDecorated`，**不看自有 prop、也不看 tagName** —— 自有 prop 一个
+   * 都没有的 @tag 类（属性整张来自无 @tag 基类）同样必须带这个 getter，否则浏览器注册
+   * 它时读到的 observedAttributes 是 undefined，attribute 驱动全部静默失效。
+   *
+   * 不用 tagName：跨文件导入常量 / 成员访问形态的 `@tag(...)` 解析不出名字，但运行时
+   * 仍会注册该类 —— 那种情况下 getter 同样必须存在。
    */
   const tagOnlyObservedAttrs = (): Pick<FieldExtractResult, 'accessors' | 'runtimeHelpers'> => {
-    if (!comp.tagName) return { accessors: '', runtimeHelpers: [] }
+    if (!comp.tagDecorated) return { accessors: '', runtimeHelpers: [] }
     return {
       accessors: `${DEBUG_DIV} observedAttributes\n${observedGetter(h)}`,
       runtimeHelpers: ['_observedAttrs'],
@@ -797,19 +800,19 @@ export function extractFieldAccessors(
   // ---- 剔除同文件祖先已提供的、逐字节相同的访问器行 ----
   accessors = dedupeAncestorAccessors(comp, ctx, accessors, inheritedAccessors)
 
-  // observedAttributes：**只给 @tag 类 emit**。
+  // observedAttributes：**只给带 @tag 的类 emit**。
   //
   // 只有 `@tag` 类会被 `customElements.define`（tag.ts：immediate 直接 define，
   // 否则经 DefinitionComponentMap → defineComponents），也只有它的表会被浏览器读。
   // 无 `@tag` 的类（纯基类 / mixin 中间层 / 跨文件基类）永不被定义，带一份
   // observedAttributes 就是死代码。
   //
-  // 条件只看 `comp.tagName`，**不看自有 prop**：一个自己一个 `@prop` 都没有的
-  // @tag 类（属性全来自无 @tag 基类）同样必须 emit —— 它的表整张来自父表。
+  // 条件用 `tagDecorated` 而非 `tagName`：标签名解析不出（跨文件导入常量 / 成员访问）
+  // 的 @tag 类运行时照样注册，取不到名字不影响这张表该不该存在。
   //
   // 体是 `_observedAttrs(this)`（运行时从合并后的 props 表推导），因此**不依赖
   // 任何祖先的 getter**：这正是「基类可以不 emit」安全的前提。详见 observedGetter 注释。
-  if (comp.tagName) {
+  if (comp.tagDecorated) {
     accessors += `${DEBUG_DIV} observedAttributes\n`
     accessors += observedGetter(h)
     if (!runtimeHelpers.includes('_observedAttrs')) runtimeHelpers.push('_observedAttrs')

@@ -353,10 +353,22 @@ function collectFreeWalk(ret: any, comp?: ComponentAnalysis, chainOut?: ChainOut
         walk(node.key, !node.computed)
         walk(node.value, false)
         return
+      case 'FunctionDeclaration': {
+        // 函数声明名绑在**外层**作用域（hoisting 语义），不是自身参数作用域。
+        // 漏掉这一句会让本函数体内的自引用/后置引用被判成自由标识符（假 E-INLINE-SCOPE）。
+        if (node.id?.name) scopes[scopes.length - 1].add(node.id.name)
+        const s = collectParams(node)
+        for (const p of node.params ?? []) walkIn(p, s)
+        scopes.push(s)
+        walk(node.body, false)
+        scopes.pop()
+        return
+      }
       case 'FunctionExpression':
-      case 'FunctionDeclaration':
       case 'ArrowFunctionExpression': {
         const s = collectParams(node)
+        // 具名函数表达式的名字只在自身作用域可见
+        if (node.type === 'FunctionExpression' && node.id?.name) s.add(node.id.name)
         // 参数默认值在参数作用域内求值
         for (const p of node.params ?? []) walkIn(p, s)
         scopes.push(s)

@@ -15,7 +15,7 @@
  * - nodeSn：walk 按文档序（元素先入列再入子）编号，与 codegen 的
  *   emitElement/emitText 序号严格一致——这是回退判定保守的根本原因。
  */
-import { PLACEHOLDER_FIRST_RE, VOID_TAGS, type TAttr, type TElement, type TNode } from '../analyze/template-tree'
+import { PLACEHOLDER_FIRST_RE, VOID_TAGS, WS_SENSITIVE_TAGS, type TAttr, type TElement, type TNode } from '../analyze/template-tree'
 import { normalizeAttrName } from './attr-name'
 
 /** HTML 树构造会重构/搬迁/丢弃的标签——出现即回退 createElement 路径。 */
@@ -67,11 +67,22 @@ export function canUseInnerHTML(root: TNode[]): boolean {
 }
 
 function checkNodes(nodes: TNode[], chain: TElement[]): boolean {
+  const parent = chain.length ? chain[chain.length - 1] : null
+  // 空白即内容的标签：运行期 walkSplitText 对含占位符的文本无条件 `.trim()`，
+  // 会丢首尾空白；单占位符时还会命中「整段恰为占位符」快路径，把多段并成 1 个节点。
+  const wsSensitive = !!parent && parent.ns === 'html' && WS_SENSITIVE_TAGS.has(parent.tag.toLowerCase())
+  let prevText = false
   for (const nd of nodes) {
     if (nd.type === 'text') {
       if (nd.raw.includes('\r')) return false
+      // 相邻文本节点：拼进同一个 HTML 串后浏览器会把它们合并成一个，节点数与
+      // 编译期 paths/updateSns 不再一一对应，后续更新点整体错位。
+      if (prevText) return false
+      if (wsSensitive && hasVar(nd.raw)) return false
+      prevText = true
       continue
     }
+    prevText = false
     if (nd.type === 'comment') {
       if (nd.text.includes('\r')) return false
       if (nd.text.includes('--') || nd.text.startsWith('>') || nd.text.startsWith('->') || nd.text.endsWith('-')) {

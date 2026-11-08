@@ -418,6 +418,25 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
   for (const c of comps) if (c.tagName) fileTags.add(c.tagName.toLowerCase())
   if (options.knownTags) for (const t of options.knownTags) fileTags.add(t.toLowerCase())
 
+  /**
+   * 本文件内重复注册的标签：后出现的类名 → 源码位置上更早、占用同一标签的类名。
+   *
+   * 运行期 `tag.ts` 遇到已定义的标签直接跳过，后注册的类既不进注册表也不报错，
+   * 其 @prop/@state/视图全部失效 —— 在编译期点出来。按 `start` 排序而不是 `comps`
+   * 顺序：`comps` 把 mixin 类统一排在后面，源码位置才与注册顺序一致。
+   */
+  const dupTagOwner = new Map<string, string>()
+  {
+    const seen = new Map<string, string>()
+    for (const c of [...comps].sort((a, b) => (a.start ?? 0) - (b.start ?? 0))) {
+      if (!c.tagName) continue
+      const lower = c.tagName.toLowerCase()
+      const first = seen.get(lower)
+      if (first) dupTagOwner.set(c.className, first)
+      else seen.set(lower, c.className)
+    }
+  }
+
   // 约定检查上下文（emit 校验 / @prop / @computed / @csscope 目标检查）
   const convCtx = {
     localClasses: collectLocalClasses(parsed),
@@ -464,6 +483,20 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
     // 错误经 `compileResult.diagnostics` 的 `conventionErrors` 出口，由 vite 插件按
     // `conventions` 力度上报。
     let conventionErrors = checkConventions(comp, convCtx)
+
+    // 同文件重复注册：第二个类静默不生效（运行期以先 define 的为准）。
+    const tagLower = comp.tagName?.toLowerCase()
+    const dupWith = tagLower ? dupTagOwner.get(comp.className) : undefined
+    if (dupWith) {
+      conventionErrors.push({
+        start: comp.start,
+        end: comp.end,
+        message:
+          `E-TAG-DUP: 标签 ${tagLower} 已被同文件的 ${dupWith} 注册 —— ` +
+          `同一标签名只能定义一个类，后注册的 ${comp.className} 不会生效` +
+          `（运行期遇到已定义的标签直接跳过，其 @prop/@state 与视图全部失效）`,
+      })
+    }
 
     // @watch 编译期解析（watch 前移）：解析成功 → 删装饰器 + 注入 watchers；
     // 有 E-WATCH-ARG → 整体放弃（不删不注），运行时装饰器路径兜底。

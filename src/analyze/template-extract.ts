@@ -9,7 +9,7 @@ import type { ComponentAnalysis } from '../types'
 import { COMpelem_DIRECTIVES } from './render-body'
 import { collectTemplateTagAliases } from './template'
 import { stripTsChecked } from './strip-ts'
-import { blockedTsText, containsBlockedTsNode, thisChain, topLevelReturns, unwrapExpr } from '../utils/ast'
+import { blockedTsText, collectPatternNames, containsBlockedTsNode, thisChain, topLevelReturns, unwrapExpr } from '../utils/ast'
 
 /**
  * 这些语句包住的 `return h`` `` **可能被跳过** ⇒ 条件会被整体丢弃（D8）。
@@ -26,6 +26,30 @@ const SKIPS_RETURN_STMTS: ReadonlySet<string> = new Set([
   'DoWhileStatement',
   'SwitchStatement',
 ])
+
+/**
+ * 判断包住模板的宿主语句是否会「有条件地跳过」其中的 return，返回该语句类型或 null。
+ *
+ * 在 SKIPS_RETURN_STMTS 之外还要处理三种包装：
+ * - `LabeledStatement`：标签本身无控制流语义，递归看它包住的语句；
+ * - 裸块：同样递归找块内直接包含模板的子语句；
+ * - `TryStatement`：只有带 `catch` 时才算 —— 异常可能被 catch 吞掉，return 变成
+ *   条件性的；`try/finally` 不吞异常，return 必然执行。
+ *
+ * 返回具体类型而不是布尔，错误消息里才能指向真正丢条件的那一层。
+ */
+function skippingHostKind(host: any, tmpl: any): string | null {
+  if (!host || typeof host.type !== 'string') return null
+  if (host.type === 'LabeledStatement') return skippingHostKind(host.body, tmpl)
+  if (host.type === 'TryStatement') return host.handler ? 'TryStatement' : null
+  if (host.type === 'BlockStatement') {
+    const inner = (host.body ?? []).find(
+      (s: any) => typeof s.start === 'number' && s.start <= tmpl.start && tmpl.end <= s.end,
+    )
+    return inner ? skippingHostKind(inner, tmpl) : null
+  }
+  return SKIPS_RETURN_STMTS.has(host.type) ? host.type : null
+}
 
 export interface TemplateVarInfo {
   /** Template 序下标 */
@@ -130,19 +154,100 @@ export const TAG_ONLY_DIRECTIVES = new Set(['bind', 'show', 'model', 'classes', 
 const HAS_UPPER_RE = /[A-Z]/
 
 /**
+ * prelude 顶层允许的语句种类。
+ *
+ * 声明类无运行期副作用；控制流类（if/for/try/switch/块）只允许出现在顶层，
+ * 其**内部**语句不再递归检查 —— 条件里做一层纯计算（`if (x) { const y = ... }`）
+ * 是常见写法，逐层判副作用既判不准也会误伤（compelem-ui 的 Menu.renderItem 即是）。
+ * 只挡最明确的一类：顶层裸语句（表达式 / throw）。
+ */
+const PRELUDE_TOP_ALLOWED: ReadonlySet<string> = new Set([
+  'VariableDeclaration',
+  'FunctionDeclaration',
+  'ClassDeclaration',
+  'EmptyStatement',
+  'BlockStatement',
+  'IfStatement',
+  'ForStatement',
+  'ForInStatement',
+  'ForOfStatement',
+  'WhileStatement',
+  'DoWhileStatement',
+  'SwitchStatement',
+  'TryStatement',
+  'LabeledStatement',
+  // 纯类型节点：无运行期语义（产物侧由 stripTs 剥掉）
+  'TSInterfaceDeclaration',
+  'TSTypeAliasDeclaration',
+  'TSDeclareFunction',
+])
+
+/**
+ * 校验 prelude 顶层只有声明与控制流，违规时返回错误文案（null 表示通过）。
+ *
+ * prelude（render() 里 return 之前、回调里 return 之前的顶层语句）在两处被消费：
+ * 引用其声明的插值工厂**逐点注入**（每轮重算，注入 N 份就是执行 N 次），以及
+ * 没有任何插值引用时**整段丢弃**。顶层裸语句（`this.bump()` / `this.x = 1`）在这
+ * 两条路上分别是「执行多次」和「一次都不执行」，都不是作者写的语义 ⇒ 编译期阻断。
+ *
+ * 返回文案而非直接抛错：主模板抛 TemplateExtractError、子模板抛 SubExtractError，
+ * 两者的归类不同。
+ */
+export function preludeStatementError(stmts: readonly any[], where: string): string | null {
+  for (const s of stmts) {
+    if (!s || typeof s.type !== 'string') continue
+    if (PRELUDE_TOP_ALLOWED.has(s.type)) continue
+    return (
+      `E-PRELUDE-STMT: ${where} 的 return 之前出现了裸语句（${s.type}）。` +
+      `prelude 会整段注入到引用它的插值工厂（每轮重算），没有任何插值引用时又整段丢弃，` +
+      `副作用因此会执行多次或一次都不执行。请把副作用移到方法或生命周期钩子里`
+    )
+  }
+  return null
+}
+
+/**
+ * render() 顶层的局部绑定名（含解构、函数声明、类声明）。
+ *
+ * 用于判断模块级 `const` 是否被 render 作用域里的同名绑定遮蔽 —— 单文件编译
+ * 只按名字查 `moduleConstInits`，不查遮蔽就会把局部值折成模块值。
+ */
+function renderTopLevelNames(comp: ComponentAnalysis): Set<string> {
+  const out = new Set<string>()
+  for (const s of comp.renderBody ?? []) {
+    if (s?.type === 'VariableDeclaration') {
+      for (const d of s.declarations ?? []) collectPatternNames(d.id, out)
+    } else if ((s?.type === 'FunctionDeclaration' || s?.type === 'ClassDeclaration') && s.id?.name) {
+      out.add(s.id.name)
+    }
+  }
+  return out
+}
+
+/**
  * 判定 `${html(CONST)}` 静态 HTML 常量折叠点，返回可折叠的 HTML 串，不满足则 undefined。
  *
  * 判据（全部满足才折）：
  *  1. 表达式是 `html(IDENT)`：`html` 解析到从 compelem 导入的 `html`，实参恰好 1 个裸标识符；
  *  2. `IDENT` 在本文件解析到**模块级 `const`**（`let`/`var` 可重新赋值，折叠会固化某次运行值）；
+ *     且当前求值作用域里没有同名绑定遮蔽它（render 顶层 / 子模板回调的形参与局部声明）；
  *  3. 初始化器是字符串字面量，或**无插值**的模板字面量；
- *  4. 整串不含大写字母（见 TemplateVarInfo.fragment 的等价性论证）。
+ *  4. 整串非空且不含大写字母（见 TemplateVarInfo.fragment 的等价性论证）。
+ *
+ * `shadowed` 由子模板调用方传入「本回调形参 + 回调体顶层声明」；主模板不传，
+ * 改查 render() 顶层声明。
  */
-export function staticHtmlFragmentOf(e: any, comp: ComponentAnalysis): string | undefined {
+export function staticHtmlFragmentOf(
+  e: any,
+  comp: ComponentAnalysis,
+  shadowed?: ReadonlySet<string>,
+): string | undefined {
   if (e?.type !== 'CallExpression' || e.callee?.type !== 'Identifier') return undefined
   if (comp.compelemImports.get(e.callee.name) !== 'html') return undefined
   const args = e.arguments ?? []
   if (args.length !== 1 || args[0]?.type !== 'Identifier') return undefined
+  if (shadowed?.has(args[0].name)) return undefined
+  if (renderTopLevelNames(comp).has(args[0].name)) return undefined
 
   const decl = comp.moduleConstInits?.get(args[0].name)
   const init = decl?.init
@@ -154,6 +259,9 @@ export function staticHtmlFragmentOf(e: any, comp: ComponentAnalysis): string | 
     html = init.quasis?.[0]?.value?.cooked ?? ''
   } else return undefined
 
+  // 空串不折：折叠后建树侧不产节点、更新侧仍按占位符编号计数 ⇒
+  // 「插值槽与更新点数量不一致」硬错误。折它没有任何收益，直接交给运行期。
+  if (html === '') return undefined
   if (HAS_UPPER_RE.test(html)) return undefined
   return html
 }
@@ -368,9 +476,10 @@ export function extractMainTemplate(
         (s: any) => typeof s.start === 'number' && s.start <= tmpl.start && tmpl.end <= s.end,
       )
       const host = hostIdx >= 0 ? stmts[hostIdx] : null
-      if (host && SKIPS_RETURN_STMTS.has(host.type)) {
+      const skipKind = skippingHostKind(host, tmpl)
+      if (skipKind) {
         throw new TemplateExtractError(
-          `D8: 组件 ${comp.className} render() 的模板 return 被包在 ${host.type} 里，` +
+          `D8: 组件 ${comp.className} render() 的模板 return 被包在 ${skipKind} 里，` +
             `该条件会被整体丢弃（视图恒渲染）。请把 return 提到 render() 顶层，` +
             `或改用 ifTrue / ifElse / when 指令包裹模板。`,
         )
@@ -388,20 +497,20 @@ export function extractMainTemplate(
   // 保护。复用已解析的 renderBody 语句 AST，不再二次 parse。文本判据（hasTsSyntax）
   // 抓不到 `<T>x` / `f<T>()`，但这两形态会随 prelude 原样进入取值函数与内联工厂。
   if (preludeSrc) {
+    const preludeStmts: any[] = []
     for (const s of stmts) {
       if (typeof s.start === 'number' && s.start > preludeEnd) break
-      if (
-        typeof s.start === 'number' &&
-        typeof s.end === 'number' &&
-        s.start >= preludeStart &&
-        s.end <= preludeEnd &&
-        containsBlockedTsNode(s)
-      ) {
+      if (typeof s.start !== 'number' || typeof s.end !== 'number') continue
+      if (s.start < preludeStart || s.end > preludeEnd) continue
+      preludeStmts.push(s)
+      if (containsBlockedTsNode(s)) {
         throw new TemplateExtractError(
           blockedTsText(`组件 ${comp.className} render() prelude`, source.slice(s.start, s.end)),
         )
       }
     }
+    const stmtErr = preludeStatementError(preludeStmts, `组件 ${comp.className} render() prelude`)
+    if (stmtErr) throw new TemplateExtractError(stmtErr)
   }
 
   return { strings, vars, start: tmpl.start, end: tmpl.end, preludeStart, preludeEnd, preludeSrc }

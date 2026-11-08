@@ -13,6 +13,8 @@
  *   E-MODEL-CHAIN   model() 的实参必须能解析出 this 写回路径
  *   W-EVENT-NO-HANDLER  @event 无插值 → 监听器为空（运行期注册 noop）
  *   W-EVENT-COMP-MODIFIER  组件事件上使用了该通道不支持的修饰符
+ *   W-TRANSITION-OPT   过渡选项对象的键不属于 enter/leave/move（show 为 transition）
+ *   W-TRANSITION-SPEC  过渡 spec 的值不是字符串/对象/null（运行期按「未声明」跳过）
  *
  * 其余同类运行时检查的编译期覆盖：
  *   - 动态根元素（vars.length != updatePointMetas.length）的三个触发条件
@@ -281,6 +283,169 @@ function isUndefinedLike(node: any): boolean {
   return node.type === 'Literal' && (node.value === null || node.value === undefined)
 }
 
+/** 结构指令的过渡选项位置：`ifTrue(cond, tpl, opts)` 在 2、`ifElse(cond, a, b, opts)` 在 3 等 */
+const STRUCT_OPT_POS: Record<string, number> = { ifTrue: 2, ifElse: 3, when: 2, forEach: 3 }
+/** 结构指令选项对象的合法键（对应运行期 `StructureTransitionOptions`） */
+const STRUCT_OPT_KEYS = new Set(['enter', 'leave', 'move'])
+/** `show()` 选项对象的合法键（对应运行期 `ShowOptions`） */
+const SHOW_OPT_KEYS = new Set(['transition'])
+/**
+ * 过渡 spec 对象的**内层**合法键（对齐 `compelem/src/types.ts:89-106`）：
+ * - `enter` / `leave` / `transition` 走 CSS 类过渡，运行期 `normalizeSpec` 只读 name/duration/delay；
+ * - `move` 走 FLIP 位移，`playMove` 只读 duration/easing（没有 name/delay）。
+ */
+const SPEC_KEYS_CSS = new Set(['name', 'duration', 'delay'])
+const SPEC_KEYS_MOVE = new Set(['duration', 'easing'])
+const SPEC_SHAPE_CSS = '{ name, duration, delay }'
+const SPEC_SHAPE_MOVE = '{ duration, easing }'
+
+/** 值能否作为过渡 spec：字符串 / 对象 / 无法静态判定的引用，以及表示关闭的 null */
+function isSpecValue(node: any): boolean {
+  if (!node) return false
+  switch (node.type) {
+    case 'Literal':
+      return node.value === null || typeof node.value === 'string'
+    case 'TemplateLiteral':
+    case 'ObjectExpression':
+    case 'Identifier':
+    case 'MemberExpression':
+    case 'CallExpression':
+    case 'ConditionalExpression':
+    case 'LogicalExpression':
+      return true
+    default:
+      return false
+  }
+}
+
+/** 字面量的中文类型名（用于提示） */
+function literalKind(node: any): string {
+  switch (node?.type) {
+    case 'ArrayExpression':
+      return '数组'
+    case 'ArrowFunctionExpression':
+    case 'FunctionExpression':
+      return '函数'
+    case 'Literal':
+      return `\`${String(node.value)}\`（${typeof node.value}）`
+    case 'UnaryExpression':
+    case 'BinaryExpression':
+      return '非字符串表达式'
+    default:
+      return node?.type ?? '未知形态'
+  }
+}
+
+/**
+ * 过渡 spec 对象的内层键校验。
+ *
+ * 外层键决定取哪套 spec（见 SPEC_KEYS_CSS / SPEC_KEYS_MOVE）。写错或写多的内层键
+ * 没有任何运行时消费点，表现为「动画参数不生效」且零提示，故与表外键同样在编译期报出。
+ *
+ * 对象里出现展开元素或计算键时整体放行：无法判定最终键集。
+ */
+function checkSpecObjectKeys(
+  name: string,
+  slot: string,
+  value: any,
+  pos: { start: number, end: number },
+): TemplateRuleError[] {
+  if (!value || value.type !== 'ObjectExpression') return []
+  for (const p of value.properties ?? []) {
+    if (p.type !== 'Property' || p.computed) return []
+  }
+  const allowed = slot === 'move' ? SPEC_KEYS_MOVE : SPEC_KEYS_CSS
+  const shape = slot === 'move' ? SPEC_SHAPE_MOVE : SPEC_SHAPE_CSS
+  const errs: TemplateRuleError[] = []
+  for (const p of value.properties ?? []) {
+    const keyNode = p.key
+    const k = keyNode?.type === 'Identifier'
+      ? keyNode.name
+      : keyNode?.type === 'Literal' && typeof keyNode.value === 'string' ? keyNode.value : null
+    if (k === null || allowed.has(k)) continue
+    errs.push({
+      ...pos,
+      severity: 'warn',
+      message:
+        `W-TRANSITION-SPEC: ${name}() 的 '${slot}' spec 对象里没有 '${k}' 这个键，` +
+        `合法键是 ${[...allowed].map((x) => `'${x}'`).join(' / ')}（${shape}）——` +
+        `运行期只按这些键取值，其余键静默忽略，动画表现与预期不符且无任何提示`,
+    })
+  }
+  return errs
+}
+
+/**
+ * 过渡选项对象的静态校验。
+ *
+ * 运行期 `transitionOptsOf` 只按 `enter` / `leave` / `move` 三个键取值、
+ * `show` 只读 `transition`，且 spec 只接受字符串或普通对象 —— 其余键与值
+ * 一律被静默忽略（表现为「动画没生效」，没有任何提示），故在编译期报出。
+ *
+ * 对象里出现展开元素或计算键时整体放行：无法判定最终键集。
+ */
+function checkTransitionOpts(
+  name: string,
+  args: any[],
+  pos: { start: number, end: number },
+): TemplateRuleError[] {
+  const errs: TemplateRuleError[] = []
+  const isShow = name === 'show'
+  const allowed = isShow ? SHOW_OPT_KEYS : STRUCT_OPT_KEYS
+  const positions = isShow ? [1, 2] : (STRUCT_OPT_POS[name] === undefined ? [] : [STRUCT_OPT_POS[name]])
+
+  for (const i of positions) {
+    const raw = args[i]
+    if (!raw) continue
+    const node = unwrapTsExpr(raw)
+    if (!node || node.type !== 'ObjectExpression') continue
+
+    let spread = false
+    for (const prop of node.properties ?? []) {
+      if (prop.type !== 'Property' || prop.computed) {
+        spread = true
+        break
+      }
+    }
+    if (spread) continue
+
+    for (const prop of node.properties ?? []) {
+      const keyNode = prop.key
+      const key = keyNode?.type === 'Identifier'
+        ? keyNode.name
+        : keyNode?.type === 'Literal' && typeof keyNode.value === 'string' ? keyNode.value : null
+      if (key === null) continue
+
+      if (!allowed.has(key)) {
+        errs.push({
+          ...pos,
+          severity: 'warn',
+          message:
+            `W-TRANSITION-OPT: ${name}() 的过渡选项里没有 '${key}' 这个键，` +
+            `合法键是 ${[...allowed].map((k) => `'${k}'`).join(' / ')}——` +
+            `运行期只按这些键取 spec，写错或写多的键会被整体忽略，动画不生效且无任何提示`,
+        })
+        continue
+      }
+
+      const value = unwrapTsExpr(prop.value)
+      const shape = key === 'move' ? SPEC_SHAPE_MOVE : SPEC_SHAPE_CSS
+      if (!isSpecValue(value)) {
+        errs.push({
+          ...pos,
+          severity: 'warn',
+          message:
+            `W-TRANSITION-SPEC: ${name}() 的 '${key}' 只能是字符串或 ${shape} 对象` +
+            `（null 表示关闭），当前是${literalKind(value)}——运行期把它当作「未声明过渡」直接跳过`,
+        })
+        continue
+      }
+      errs.push(...checkSpecObjectKeys(name, key, value, pos))
+    }
+  }
+  return errs
+}
+
 /**
  * 指令实参的静态校验（forEach keyFn / model 写回路径）。
  *
@@ -298,6 +463,10 @@ export function checkDirectiveArgs(
     if (!name) continue
     const args: any[] = v.node?.arguments ?? []
     const pos = { start: v.start ?? 0, end: v.end ?? 0 }
+
+    // ---- W-TRANSITION-OPT / W-TRANSITION-SPEC：过渡选项对象的键与值 ----
+    // 与具体指令的其它校验无关，先跑；forEach 分支末尾的 continue 不会漏掉它。
+    errs.push(...checkTransitionOpts(name, args, pos))
 
     // ---- E-FOREACH-KEY：运行期无条件 `keyFn.call(...)` ----
     if (name === 'forEach') {

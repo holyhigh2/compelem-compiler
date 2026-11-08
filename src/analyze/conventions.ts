@@ -632,6 +632,44 @@ export function checkConventions(
   const isComputedDec = (local: string) => comp.compelemImports.get(local) === 'computed'
   const isCsscopeDec = (local: string) => comp.compelemImports.get(local) === 'csscope'
 
+  // ---- 0. @tag 实参：必须能静态解析成标签名 ----
+  // 解析不出来时 `tagName` 为空 —— 编译器不知道这个类对应哪个标签，`fileTags` 登记
+  // 不到它，同文件模板里的组件标签识别会退化成「含连字符即放行」。类本身仍会被
+  // 编译（`tagDecorated` 与标签名是两件事），故这里只是名字层面的失败。
+  //
+  // 唯一放行的是「实参的根标识符跨文件导入」：单文件编译拿不到它的值，报错只会
+  // 误伤合法代码。同文件对象成员（`TAGS.App`）在 component.ts 里已能静态解析，
+  // 走到这里说明那个键确实不存在 ⇒ 运行期 name 为 undefined，必须拦。
+  const tagDec = (cls.decorators ?? []).find((d: any) => {
+    const n = decoratorName(d)
+    return n ? comp.compelemImports.get(n) === 'tag' : false
+  })
+  if (tagDec) {
+    const expr = tagDec.expression ?? tagDec
+    const arg = expr.type === 'CallExpression' ? expr.arguments?.[0] : undefined
+    if (!arg) {
+      errs.push({
+        start: tagDec.start,
+        end: tagDec.end,
+        message: 'E-TAG-ARG: @tag 必须带一个标签名字符串（如 @tag("x-foo")）',
+      })
+    } else if (!comp.tagName) {
+      // 实参的根标识符：`TAG` 或 `TAGS.App` / `TAGS['App']` 里的 `TAGS`
+      const root = unwrapExpr(arg)?.type === 'MemberExpression' ? arg.object : arg
+      const rootName = root?.type === 'Identifier' ? root.name : undefined
+      const imported = !!rootName && ctx.importedLocals.has(rootName)
+      if (!imported) {
+        errs.push({
+          start: arg.start,
+          end: arg.end,
+          message:
+            'E-TAG-ARG: @tag 实参必须是字符串字面量、同文件常量、或同文件常量对象的静态成员——' +
+            '解析不出名字时编译器无法登记该标签，请在实参里写字面量',
+        })
+      }
+    }
+  }
+
   // ---- 1. @emits 声明收集（含继承链） ----
   const { declared, hasOpaque } = collectDeclaredEmits(
     cls,

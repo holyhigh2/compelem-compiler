@@ -47,6 +47,11 @@ export interface CompiledStatic {
   props?: Record<string, any>
   /** state 定义表（同上，合并语义） */
   states?: Record<string, any>
+  /**
+   * `@resource` 纯数据选项表（`name → { timeout, immediate, track, ... }`）。
+   * 运行期按表在原型上安装同名 getter，loader/source 函数放在 `__rl_*` / `__rs_*` 方法上。
+   */
+  resources?: Record<string, any>
   /** `@computed` getter 函数外提（装饰器与成员被剥离）；仅 devtools 元数据消费 */
   computedGetters?: Record<string, () => any>
   /** `@watch` 产物：每个 watch 一个 effect 工厂，setup 期逐条 `effect(factory(this))` */
@@ -72,22 +77,8 @@ export interface CompiledStatic {
 }
 
 /**
- * `@watch` 的**分析期**条目（`analyze/watch-extract.ts` 产出）。
- *
- * 注意：它**不是**产物的一部分 —— 编译进产物的是 `watchEffects` 工厂数组，
- * 编译完成后本条目即丢弃。保留本类型是因为 generateBuildVars 要读 `extras`。
+ * 响应式字段类别，用于判定「该成员是否会被推入依赖收集列表」。
  */
-export interface WatchEntry {
-  name: string
-  sources: string[]
-  deep?: boolean
-  immediate?: boolean
-  once?: boolean
-  /** 宿主成员是否为 static（决定 effect 里取 `rc.constructor` 还是 `rc`） */
-  isStatic?: boolean
-}
-
-/** 响应式字段类别，用于判定「该成员是否会被推入依赖收集列表」。 */
 export type ReactiveKind = 'prop' | 'state' | 'computed'
 
 /** 组件内一个响应式成员的信息。 */
@@ -119,8 +110,16 @@ export interface ComponentAnalysis {
    * 对象字面量里，产出整模块语法错误。-1 表示无 AST 可用（调用方应回退扫描）。
    */
   bodyStart: number
-  /** `@tag` 名称，无则 undefined */
+  /** `@tag` 名称，无则 undefined。静态解析不出（跨文件导入常量 / 成员访问）时也为 undefined */
   tagName?: string
+  /**
+   * 本类是否带 `@tag` 装饰器 —— 与 `tagName` 是两件事。
+   *
+   * `tagName` 只在标签名可静态解析时才有值；而这个标记只说明「类会被注册」。
+   * 凡是 `@tag` 类都必须 emit `observedAttributes` getter（浏览器只读被 define 的
+   * 那个类的表），故该判定不能依赖 `tagName`。
+   */
+  tagDecorated?: boolean
   /** 本类自身声明的响应式字段（按声明顺序；继承链由依赖提取另行上溯） */
   fields: Map<string, ReactiveField>
   /** 本类自身定义的实例方法名（D2：自有方法值不可变，不推入依赖，无需拒绝） */

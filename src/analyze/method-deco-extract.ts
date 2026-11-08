@@ -208,11 +208,14 @@ export function extractMethodDecos(
             `this.${memberName}?.cancel?.(); this.${memberName} = ${NOOP}; this.${memberName}_$__ = ${NOOP};`
           usedHelpers.add('debounce')
         } else {
-          // throttled：包装原函数，_$__ 即原函数（**无 guard**）
+          // throttled：包装原函数，_$__ 即原函数（**无 guard**）。
+          // destroy 必须 cancel()：throttle 的尾随定时器回调调的是**原始 fn**（myfx
+          // throttle.ts 的 proxy），不经过 `this.<name>`，所以置 NOOP 拦不住它 ——
+          // 不 clear 就会在销毁后仍执行一次原方法（访问已拆的 DOM）。
           push(`this.${memberName} = throttle(${f}, ${wait});`)
           push(`this.${memberName}_$__ = ${f};`)
           result.destroyStmts += (result.destroyStmts ? '\n' : '') +
-            `this.${memberName} = ${NOOP}; this.${memberName}_$__ = ${NOOP};`
+            `this.${memberName}?.cancel?.(); this.${memberName} = ${NOOP}; this.${memberName}_$__ = ${NOOP};`
           usedHelpers.add('throttle')
         }
       }
@@ -222,6 +225,26 @@ export function extractMethodDecos(
 
     for (const member of node.body?.body ?? []) {
       if (member.type !== 'MethodDefinition') continue
+      // 多个包装装饰器叠在同一方法上：产物是构造期「读 this.x → 包装 → 写回」，
+      // 两次写回互相覆盖 ⇒ 只有一个包装真正生效，且生效的顺序与 TS 装饰器语义相反。
+      // 这种组合没有可解释的运行期语义，直接阻断（不猜用户意图）。
+      const kinds: string[] = []
+      for (const d of member.decorators ?? []) {
+        const dn = decoratorName(d)
+        if (dn && kindOf(dn)) kinds.push(dn)
+      }
+      if (kinds.length > 1) {
+        failed = true
+        result.errors.push({
+          start: member.start ?? 0,
+          end: member.end ?? 0,
+          message:
+            `E-METHOD-DECO-STACK: 方法 '${keyName(member.key) ?? '?'}' 上叠加了 ` +
+            `${kinds.map((k) => '@' + k).join(' / ')} —— 多个包装装饰器会互相覆盖，` +
+            `产物只有最后一次赋值生效。请只保留一个`,
+        })
+        continue
+      }
       for (const dec of member.decorators ?? []) {
         handle(member, dec)
       }

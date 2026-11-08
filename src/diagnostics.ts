@@ -49,10 +49,13 @@ export function offsetToLineCol(code: string, offset: number, nl?: Int32Array): 
 
 /** 相对 root 的展示路径（统一正斜杠，便于点击跳转）。 */
 export function relativeToRoot(id: string, root: string): string {
-  const norm = (s: string) => s.replace(/\\/g, '/')
+  const norm = (s: string) => s.replace(/\\/g, '/').replace(/\/+$/, '')
   const rel = norm(id)
   const base = norm(root)
-  return rel.startsWith(base) ? rel.slice(base.length + 1) : id
+  if (!base) return rel
+  if (rel === base) return ''
+  // 必须按路径段对齐：`/foo/bar` 不能匹配 `/foo/barbaz`，否则会切出 `az/x.ts`
+  return rel.startsWith(base + '/') ? rel.slice(base.length + 1) : id
 }
 
 /**

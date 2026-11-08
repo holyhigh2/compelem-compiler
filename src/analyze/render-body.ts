@@ -28,13 +28,18 @@ export const COMpelem_DIRECTIVES = new Set([
   'forEach', 'ifTrue', 'ifElse', 'when', 'slot', 'html',
 ])
 
-/** 指令实参中，哪些下标是「模板回调」（其函数体属于子视图）。导出供 template-subs 分区。 */
-export const TEMPLATE_ARG_INDEX: Record<string, number[] | 'rest-after-0'> = {
+/**
+ * 指令实参中，哪些下标是「模板回调」（其函数体属于子视图）。导出供 template-subs 分区。
+ *
+ * `when` 的分支枚举在 `template-subs` 的 `collectWhenCases` 里单独展开：它的
+ * 第 2 实参是对象/数组字面量而非函数，数量也不定。第 3 实参是过渡选项，属调用方作用域。
+ */
+export const TEMPLATE_ARG_INDEX: Record<string, number[]> = {
   ifTrue: [1],
   ifElse: [1, 2],
   forEach: [2],
   slot: [0],
-  when: 'rest-after-0',
+  when: [1],
 }
 
 interface ScanCtx {
@@ -234,8 +239,7 @@ function scanNode(ctx: ScanCtx, node: any, parent: any) {
       const tmplIdx = TEMPLATE_ARG_INDEX[importedAs]
       const args: any[] = node.arguments ?? []
       args.forEach((arg: any, i: number) => {
-        const isTemplate =
-          tmplIdx === 'rest-after-0' ? i >= 1 : Array.isArray(tmplIdx) && tmplIdx.includes(i)
+        const isTemplate = Array.isArray(tmplIdx) && tmplIdx.includes(i)
         if (isTemplate && (arg.type === 'ArrowFunctionExpression' || arg.type === 'FunctionExpression')) {
           const key = arg.start
           const prev = ctx.subKey
