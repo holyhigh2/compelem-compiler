@@ -898,6 +898,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                         inliner.prelude ?? '',
                         subParams,
                         liftPreludeNames,
+                        fieldRes.stateTriggers,
                       )
                       if (!subRe.usedGet && inliner.prelude != null) {
                         for (const w of subRe.writers) writers.add(w)
@@ -989,6 +990,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                       ranges: varIndexToRange,
                       prelude: fxPrelude,
                       preludeNames,
+                      triggers: fieldRes.stateTriggers,
                     })
                     : undefined
                   if (re) {
@@ -1059,6 +1061,7 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
                       inliner.prelude ?? '',
                       subParams,
                       subPreludeNames,
+                      fieldRes.stateTriggers,
                     )
                     if (subRe.usedGet || inliner.prelude == null) {
                       tmplErrors = [

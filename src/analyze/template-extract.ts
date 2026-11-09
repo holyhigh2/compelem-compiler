@@ -190,6 +190,9 @@ const PRELUDE_TOP_ALLOWED: ReadonlySet<string> = new Set([
  * 没有任何插值引用时**整段丢弃**。顶层裸语句（`this.bump()` / `this.x = 1`）在这
  * 两条路上分别是「执行多次」和「一次都不执行」，都不是作者写的语义 ⇒ 编译期阻断。
  *
+ * 例外：`void <纯成员读>` 是框架的**视图依赖注册**（首渲染把信号收进 ViewDepMap，
+ * 惰性分支不执行时尤其必要），不是写副作用 —— 见 isVoidDepRead。
+ *
  * 返回文案而非直接抛错：主模板抛 TemplateExtractError、子模板抛 SubExtractError，
  * 两者的归类不同。
  */
@@ -197,6 +200,7 @@ export function preludeStatementError(stmts: readonly any[], where: string): str
   for (const s of stmts) {
     if (!s || typeof s.type !== 'string') continue
     if (PRELUDE_TOP_ALLOWED.has(s.type)) continue
+    if (isVoidDepRead(s)) continue
     return (
       `E-PRELUDE-STMT: ${where} 的 return 之前出现了裸语句（${s.type}）。` +
       `prelude 会整段注入到引用它的插值工厂（每轮重算），没有任何插值引用时又整段丢弃，` +
@@ -204,6 +208,51 @@ export function preludeStatementError(stmts: readonly any[], where: string): str
     )
   }
   return null
+}
+
+/**
+ * 判定 `void this.version` / `void settings.ai.apiKey` 这类**依赖注册**语句。
+ *
+ * 这类语句幂等：被注入 N 个插值工厂只是重复登记同一个依赖，被整段丢弃也只是
+ * 少一次登记 —— 都不产生 `this.bump()` / `this.x = 1` 那种「执行多次或一次都不
+ * 执行」的写副作用 ⇒ 不该按裸语句阻断。
+ *
+ * 只认**纯成员链**：argument 必须是 MemberExpression（可包在 ChainExpression 里），
+ * 且子树中不含 Call / New / Assignment / Update / Await / TaggedTemplate。
+ * `void settings.aiReady()`、`void this.#sync()` 这类真调用继续按裸语句拦截 ——
+ * 它们才是需要"移到方法或生命周期钩子"的东西。
+ */
+function isVoidDepRead(s: any): boolean {
+  if (s?.type !== 'ExpressionStatement') return false
+  const e = s.expression
+  if (!e || e.type !== 'UnaryExpression' || e.operator !== 'void') return false
+  let arg = e.argument
+  if (arg?.type === 'ChainExpression') arg = arg.expression
+  if (arg?.type !== 'MemberExpression') return false
+
+  const blocked = new Set([
+    'CallExpression',
+    'NewExpression',
+    'AssignmentExpression',
+    'UpdateExpression',
+    'AwaitExpression',
+    'TaggedTemplateExpression',
+  ])
+  const seen = new Set<object>()
+  const pure = (n: any): boolean => {
+    if (!n || typeof n !== 'object' || seen.has(n)) return true
+    seen.add(n)
+    if (typeof n.type === 'string' && blocked.has(n.type)) return false
+    for (const k of Object.keys(n)) {
+      if (k === 'start' || k === 'end' || k === 'loc' || k === 'range') continue
+      const v = (n as any)[k]
+      if (Array.isArray(v)) {
+        for (const x of v) if (!pure(x)) return false
+      } else if (v && typeof v === 'object' && typeof v.type === 'string' && !pure(v)) return false
+    }
+    return true
+  }
+  return pure(arg)
 }
 
 /**

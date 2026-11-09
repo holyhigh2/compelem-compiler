@@ -178,6 +178,15 @@ export interface InlineCtx {
   prelude?: string
   /** prelude 顶层声明的局部变量名（含解构 pattern），`usesPrelude` 据此判断注入点 */
   preludeNames?: ReadonlySet<string>
+  /**
+   * `@state({ trigger: true })` 的成员名。
+   *
+   * 这些 state 不一定出现在任何插值表达式里，但变化时必须让每个视图点重算。
+   * 生成器在每个 point effect 体开头注入 `void rc["<name>"]`（读取即注册依赖）；
+   * 与作者手写 `void this.x` 语义相同，但不依赖 prelude 是否被引用 —— 后者在
+   * 没有插值引用 prelude 局部变量时会整段丢弃，手写的注册会静默失效。
+   */
+  triggers?: readonly string[]
 }
 
 /**
@@ -344,6 +353,15 @@ export function generateRenderEffect(
     usesPrelude(inst) ? `(rc) => { ${fxPrelude}\nreturn (${inst}) }` : `(rc) => (${inst})`
   /** effect 体工厂的内层取值前缀：引用 prelude 变量时注入声明。 */
   const bodyPrelude = (src: string): string => (usesPrelude(src) ? fxPrelude + '\n' : '')
+  /**
+   * trigger 依赖注册：每个 effect 体开头读一次。
+   *
+   * 用 `rc["name"]` 而不是 `rc.name`：state 名允许 `$` 前缀（合法标识符），方括号
+   * 写法对任何字符串键都成立，且同样走访问器 getter（读信号 → 建立订阅）。
+   */
+  const depRead = ictx?.triggers?.length
+    ? ictx.triggers.map((name) => `void rc[${JSON.stringify(name)}];`).join(' ') + ' '
+    : ''
   let n = 0
   const nodeOf = (up: UpOut) => `nodes[${up.nodeSn}]`
   for (const up of ups) {
@@ -371,7 +389,7 @@ export function generateRenderEffect(
       writers.add(entry)
       // 第 5 实参传完整 DirectiveInstance：同一元素可叠多个 TAG 指令（classes+styles+show），
       // __dirNodeMap 按 node 反查会互相覆盖，运行时据实例的 diFn 挑回正确的 UpdatePoint
-      const f = `(rc, nodes, ${P_GET}) => { let ${L_OLD}; return () => { ${bodyPrelude(val)}const ${lA('')} = (${val}); if (${lA('')}[1][0] !== ${L_OLD} || rc.__f) { ${entry}(rc, ${nodeOf(up)}, ${lA('')}[1][0], ${L_OLD}, ${lA('')}); ${L_OLD} = ${lA('')}[1][0] } } }`
+      const f = `(rc, nodes, ${P_GET}) => { let ${L_OLD}; return () => { ${depRead}${bodyPrelude(val)}const ${lA('')} = (${val}); if (${lA('')}[1][0] !== ${L_OLD} || rc.__f) { ${entry}(rc, ${nodeOf(up)}, ${lA('')}[1][0], ${L_OLD}, ${lA('')}); ${L_OLD} = ${lA('')}[1][0] } } }`
       fast.push(f)
       // fx 返回 DirectiveInstance 供 renderTemplate 首屏执行（与 pointEffects 共用工厂源码）
       fx.push(exprFx(val))
@@ -396,7 +414,7 @@ export function generateRenderEffect(
       n++
       continue
     }
-    const factory = `(rc, nodes, ${P_GET}) => { let ${L_OLD}; return () => { ${bodyPrelude(src)}const ${L_NEW} = ${src}; if (${p.guard} || rc.__f) { ${p.write(L_NEW, p.node!)}; ${p.store(L_NEW, L_OLD)} } } }`
+    const factory = `(rc, nodes, ${P_GET}) => { let ${L_OLD}; return () => { ${depRead}${bodyPrelude(src)}const ${L_NEW} = ${src}; if (${p.guard} || rc.__f) { ${p.write(L_NEW, p.node!)}; ${p.store(L_NEW, L_OLD)} } } }`
     // prop 点：fx 必须返回**值**而不是 effect 工厂。
     //
     // 原因在 renderTemplate：子组件首帧还是 wrapper（见
@@ -514,6 +532,7 @@ export function generateSubInlinedEffect(
   prelude: string,
   paramsCode: string,
   preludeNames?: Set<string>,
+  triggers?: readonly string[],
 ): RenderEffectGen {
   const stmts: string[] = []
   const fx: string[] = []
@@ -601,7 +620,7 @@ export function generateSubInlinedEffect(
     n++
   }
   const pe = stmts.length
-    ? `[${peSig} => () => { ${prelude ? prelude + '\n' : ''}${stmts.join(' ')} }]`
+    ? `[${peSig} => () => { ${triggers?.length ? triggers.map((name) => `void rc[${JSON.stringify(name)}];`).join(' ') + ' ' : ''}${prelude ? prelude + '\n' : ''}${stmts.join(' ')} }]`
     : '[]'
   return { arrayExpr: pe, fxExpr: `[${fx.join(',')}]`, usedGet, writers }
 }

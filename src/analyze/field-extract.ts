@@ -57,6 +57,14 @@ export interface FieldExtractResult {
   propsCode?: string
   /** `__ce_static__.states` 字面量值 */
   statesCode?: string
+  /**
+   * `@state({ trigger: true })` 的成员名（声明顺序）。
+   *
+   * 语义：这些 state 不一定出现在模板表达式里，但变化时必须让**每个视图点**
+   * 重算一遍（粗粒度失效扳机）。代码生成阶段把它们作为依赖注册注入到每个
+   * point effect 体（等价于作者手写 `void this.x`，但不依赖 prelude 是否被引用）。
+   */
+  stateTriggers?: string[]
   /** `__ce_static__.computedGetters` 字面量值（方法简写 name(){...}） */
   computedCode?: string
   /** prop/state 初始值 → 构造体写入语句素材（原字段声明改写为构造体赋值） */
@@ -95,7 +103,7 @@ const FAM_CODE: Record<Family, string> = {
 const PROP_OPTION_KEYS: ReadonlySet<string> = new Set([
   'shallow', 'type', 'required', 'model', 'attribute', 'hasChanged', 'converter', 'isValid',
 ])
-const STATE_OPTION_KEYS: ReadonlySet<string> = new Set(['shallow', 'hasChanged'])
+const STATE_OPTION_KEYS: ReadonlySet<string> = new Set(['shallow', 'hasChanged', 'trigger'])
 
 /**
  * 收集 options 里不在 `allowed` 内的键名（去重，保持书写顺序）。
@@ -444,6 +452,8 @@ export function extractFieldAccessors(
     selector?: string
     all?: boolean
     once?: boolean
+    /** `@state({ trigger: true })`：作为每个视图点的依赖注册 */
+    trigger?: boolean
     initText?: string
     /** 编译期推导的构造器名（与运行时 PropTypeMap 同域） */
     inferredType?: string
@@ -619,6 +629,8 @@ export function extractFieldAccessors(
       const rawSeed = parseSeedProp(member.value)
       const seedProp = rawSeed && !localStateishFields.has(rawSeed) ? rawSeed : undefined
       let optsText = '{}'
+      /** `@state({ trigger: true })`：是否作为每个视图点的依赖注册 */
+      let triggerOpt = false
       if (expr.type === 'CallExpression') {
         const args = expr.arguments ?? []
         if (args.length !== 1) {
@@ -641,6 +653,26 @@ export function extractFieldAccessors(
           )
           continue
         }
+
+        // trigger 必须是字面量布尔：它决定代码生成，运行期才求值的表达式无法兑现语义
+        let triggerInvalid = false
+        for (const e of seq) {
+          if (e.kind !== 'prop' || keyName(e.node.key) !== 'trigger') continue
+          const v = unwrapTsExpr(e.node.value)
+          // 兼容两套 AST 命名：Babel 的 BooleanLiteral 与 ESTree 的 Literal
+          const lit =
+            v?.type === 'BooleanLiteral'
+              ? (v.value as boolean)
+              : v?.type === 'Literal' && typeof v.value === 'boolean'
+                ? (v.value as boolean)
+                : undefined
+          if (lit === undefined) triggerInvalid = true
+          else triggerOpt = lit
+        }
+        if (triggerInvalid) {
+          failMember(family, member, `E-STATE-ARG: @state 的 trigger 必须是字面量 true / false`)
+          continue
+        }
       }
       const meta = seedProp ? {} : inferInitMeta(member.value)
       acc.removals.push(memberSpan(member, dec))
@@ -650,6 +682,7 @@ export function extractFieldAccessors(
         initText: member.value ? code.slice(member.value.start, member.value.end) : undefined,
         inferredType: meta.typeName,
         seedProp,
+        trigger: triggerOpt || undefined,
       })
       acc.accessors.push(
         `get ${name}() { return this.__s.${name}.value }\n`,
@@ -763,6 +796,13 @@ export function extractFieldAccessors(
   commit('computed', (a) => `{ ${a.items.map((i) => `${JSON.stringify(i.name)}()${i.bodyText}`).join(', ')} }`)
   commit('query', () => undefined)
 
+  // state 族整体失败（未 commit）时它的 trigger 也不能生效 —— 那些访问器没被注入，
+  // 读数只会得到 undefined，注入依赖反而是误导。
+  const stateTriggers: string[] = []
+  if (committed.has('state')) {
+    for (const i of accs.state.items) if (i.trigger) stateTriggers.push(i.name)
+  }
+
   // prop/state 信号 + computed 信号体 → 构造体写入素材
   // （字段声明已整体删除；访问器统一读 `__s.<name>.value`，
   //  故**每个**已提交成员都必须建信号——无默认值者建 `signal(undefined)`，
@@ -817,5 +857,15 @@ export function extractFieldAccessors(
     accessors += observedGetter(h)
     if (!runtimeHelpers.includes('_observedAttrs')) runtimeHelpers.push('_observedAttrs')
   }
-  return { removals, accessors, propsCode, statesCode, computedCode, fieldInits, runtimeHelpers, errors }
+  return {
+    removals,
+    accessors,
+    propsCode,
+    statesCode,
+    computedCode,
+    fieldInits,
+    runtimeHelpers,
+    errors,
+    stateTriggers: stateTriggers.length ? stateTriggers : undefined,
+  }
 }
