@@ -1,6 +1,6 @@
 {
   "name": "@compelem/compiler",
-  "version": "0.30.0-beta.8",
+  "version": "0.30.0-beta.9",
   "description": "A compiler for compelem",
   "type": "module",
   "license": "MIT",
@@ -44,12 +44,12 @@
     "magic-string": "^0.30.11"
   },
   "peerDependencies": {
-    "myfx": "^2.0.0-beta.4"
+    "myfx": "^2.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "happy-dom": "^20.14.5",
-    "myfx": "^2.0.0-beta.4",
+    "myfx": "^2.0.0",
     "rolldown": "^1.2.9",
     "tsdown": "^0.15.0",
     "typescript": "^5.7.3",
