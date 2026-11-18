@@ -744,10 +744,6 @@ export function extractFieldAccessors(
    * vite 报 `vite:oxc PARSE_ERROR Unexpected token`）。
    *
    * 只吃**最后一个**字符为 `,` 的情况，故注释里带逗号（`{ a: 1 ␟,␟ }` 形式）不受影响。
-   *
-   * ⚠️ 先剥 `//` 行注释：fieldEntryText 会把本切片折进单行 `{ … }`，尾随行注释
-   * （`@prop({ type: String, // 说明\n})`）经 trim 失去换行后会吞掉产物的闭括号
-   * 与追加属性 ⇒ 注入产物语法错误。字符串里的 `//` 不受影响（见 stripLineComments）。
    */
   function optsInnerText(text: string): string {
     let t = stripLineComments(text).trim()

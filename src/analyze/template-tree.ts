@@ -3,13 +3,20 @@
  *
  * 与运行时正则管线（parseTemplate/convertHTML/createTemplate）的**根本区别**：
  * 本模块解析的是**开发者源码**（见 docs/TEMPLATE-CODEGEN.md §3）——
- * 不做 innerHTML 解析、convertHTML、自动闭合与实体解码。
+ * 不做 innerHTML 解析、convertHTML、自动闭合。
  * 相关容错行为在本层均为**编译错误**（静态编译唯一路径）。
+ *
+ * 静态片段（文本与属性值）里的 HTML 实体（`&nbsp;` 等）在本层解码成真字符：
+ * codegen 的 createElement/innerHTML 两条路径都不会像浏览器那样自动解码，必须在编译期做。
+ * 真 rawtext 标签（script/style/xmp...）下的文本是真内容，不解码；
+ * 插值值由运行时决定，也不解码。
  *
  * 占位符 token 与 compelem `src/constants.ts` 的 PLACEHOLDER 一致：
  * 解析时以 `⟬Ċ⟭N`（N = Template 序，即源码插值顺序）拼接 quasis，
  * 与运行时 parseTemplate 的编号空间相同 —— 保证 attrTmpl 生成物逐字节可比。
  */
+
+import { decodeEntities } from '../utils/entities'
 
 /** 与 compelem constants.ts PLACEHOLDER 完全一致（⟬ + Ċ + ⟭）。 */
 export const PLACEHOLDER = '⟬Ċ⟭'
@@ -123,6 +130,19 @@ export const WS_SENSITIVE_TAGS: ReadonlySet<string> = new Set([
 ])
 
 /**
+ * 真 rawtext 标签：内容字面、浏览器**不解码实体**，编译期同样豁免。
+ * 注意与 WS_SENSITIVE_TAGS 区分：textarea/title 是 RCDATA、pre/listing 是
+ * 普通元素，空白敏感但实体照常解码，不在此集合。
+ */
+export const ENTITY_RAWTEXT_TAGS: ReadonlySet<string> = new Set([
+  'script',
+  'style',
+  'xmp',
+  'noembed',
+  'noframes',
+])
+
+/**
  * 解析源码级模板串为节点树。
  *
  * 抛出 `TemplateParseError` 表示源码写法不受 codegen 支持（静态编译下不允许回退）。
@@ -139,6 +159,24 @@ export function parseTemplateTree(
 
   const err = (msg: string): never => {
     throw new TemplateParseError(msg, i)
+  }
+
+  // 静态片段（文本/属性值）的实体解码：只对 static 片段做，var 占位符原样拼回。
+  // 解码结果若出现占位符序列（数字实体可构造 ⟬Ċ⟭），会被误认成插值 → 编译错误。
+  const decodeStatic = (raw: string, inAttr: boolean): string => {
+    if (raw.indexOf('&') < 0) return raw
+    const parts = splitParts(raw)
+    if (!parts.some((p) => p.type === 'static' && p.text.indexOf('&') >= 0)) return raw
+    return parts
+      .map((p) => {
+        if (p.type !== 'static') return `${PLACEHOLDER}${p.index}`
+        const decoded = decodeEntities(p.text, inAttr)
+        if (decoded.indexOf(PLACEHOLDER) >= 0) {
+          err('HTML 实体解码产生了模板占位符序列（⟬Ċ⟭），请改写实体或改用插值')
+        }
+        return decoded
+      })
+      .join('')
   }
 
   while (i < n) {
@@ -225,6 +263,9 @@ export function parseTemplateTree(
             j = k
           }
         }
+        // 属性值与文本同口径解码（浏览器对属性值也解码实体，含 rawtext 标签的属性）；
+        // inAttr 规则：无分号命名实体后随 `=` 时不解码（URL 查询串 `&copy=2` 不误伤）
+        if (attrValue != null) attrValue = decodeStatic(attrValue, true)
         el.attrs.push({ name: attrName, value: attrValue, parts: attrValue == null ? [] : splitParts(attrValue) })
       }
       i = j
@@ -238,10 +279,6 @@ export function parseTemplateTree(
         }
         const valVars = a.parts.filter((p): p is TVarPart => p.type === 'var').length
         if (valVars > 1) err(`属性 ${a.name} 的值最多允许一个插值（对齐 EXP_ATTR_CHECK）`)
-        // 实体检查对静态/动态属性都生效（setAttribute 不解码，与 innerHTML 行为有差异 → 强制写明面字符）
-        if (a.value != null && /&[a-zA-Z#0-9]+;/.test(a.value)) {
-          err(`属性 ${a.name} 的值包含 HTML 实体；codegen 不做实体解码，请直接书写目标字符`)
-        }
       }
 
       if (lower === 'svg' && !selfClosing) inSvg = true
@@ -253,10 +290,16 @@ export function parseTemplateTree(
       continue
     }
 
-    // 文本节点：到下一个 '<' 为止（原样保留，含纯空白 —— 分裂/裁剪在 codegen 层做）
+    // 文本节点：到下一个 '<' 为止（含纯空白 —— 分裂/裁剪在 codegen 层做）
     let end = html.indexOf('<', i)
     if (end < 0) end = n
-    const raw = html.slice(i, end)
+    let raw = html.slice(i, end)
+    // 静态文本里的 HTML 实体在编译期解码：codegen 两条路径都不会自动解码。
+    // 真 rawtext 标签（script/style/xmp...）的内容是真内容，保持字面。
+    const parentLower = stack.length ? stack[stack.length - 1].lower : null
+    if (!parentLower || !ENTITY_RAWTEXT_TAGS.has(parentLower)) {
+      raw = decodeStatic(raw, false)
+    }
     parent.push({ type: 'text', raw, parts: splitParts(raw) })
     i = end
   }

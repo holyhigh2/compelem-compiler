@@ -569,12 +569,6 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       methodDecoDestroy: mdRes.destroyStmts || undefined,
       // 五族访问器要的是 **compelem** 的运行时函数；per-point 写入器（`wText`/`wAttr`…）
       // 同样是 compelem 的模块级自由函数 —— 走同一通道，文件级取并集。
-      //
-      // ⚠️ 用 **getter** 而非快照：`writers` 要到后面的模板 codegen 才被填上
-      // （generateRenderEffect / generateSubInlinedEffect 跑完才有名字），而本对象
-      // 在 noView / skipInjection 分支是**提前** spread 走的。取快照会永远拿到空集
-      // → 产物 emit 了 `wText(...)` 却没有 import → 运行期 ReferenceError。
-      // getter 在 `...fieldExtras` 展开（即 edits.push）时才求值，那时 codegen 已完成。
       get helpers() {
         const all = [...fieldHelpers, ...resHelpers, ...writers]
         return all.length ? [...new Set(all)] : undefined
@@ -620,10 +614,6 @@ export function compileFile(code: string, id: string, options: CompilerOptions =
       writers.add('wCssVars')
       cssEffectCode = `(rc) => { let ov; return () => { const nv = [${signalReads}]; let changed = ov === undefined; if (!changed) { for (let i = 0; i < nv.length; i++) { if (!Object.is(nv[i], ov[i])) { changed = true; break } } } if (changed) { wCssVars(rc); ov = nv } } }`
     } else if (cssDeps === undefined && comp.cssVarsBody && comp.cssVarsBody.length) {
-      /**
-       * ⚠️ **依赖提取失败 ⇒ 「全根兜底」，而不是「什么都不生成」。**
-
-       */
       writers.add('wCssVars')
       cssEffectCode =
         `(rc) => { let ov, ks; return () => { const s = rc.__s; if (!ks) ks = Object.keys(s); const nv = []; ` +

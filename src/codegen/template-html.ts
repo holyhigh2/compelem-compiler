@@ -10,7 +10,7 @@
  * - 文本：序列化转义 `&`/`<`（script/style 不转义）→ 解析期实体解码 → 还原原文；
  *   `\r` 会被预处理归一为 `\n` → 含 CR 的文本/属性一律回退。
  * - 属性：静态属性按源顺序写入 → setAttribute 同序同值；动态/事件/ref/slot-props
- *   属性不写入（不 setAttribute）。属性值源码禁实体（parse 约束）→ 转义往返无损。
+ *   属性不写入（不 setAttribute）。属性值源码中的实体已在编译期解码 → 转义往返无损。
  * - 注释：原样往返（会破坏往返的写法回退）；注释不计 nodeSn（walk 跳过）。
  * - nodeSn：walk 按文档序（元素先入列再入子）编号，与 codegen 的
  *   emitElement/emitText 序号严格一致——这是回退判定保守的根本原因。
@@ -68,9 +68,10 @@ export function canUseInnerHTML(root: TNode[]): boolean {
 
 function checkNodes(nodes: TNode[], chain: TElement[]): boolean {
   const parent = chain.length ? chain[chain.length - 1] : null
-  // 空白即内容的标签：运行期 walkSplitText 对含占位符的文本无条件 `.trim()`，
-  // 会丢首尾空白；单占位符时还会命中「整段恰为占位符」快路径，把多段并成 1 个节点。
-  const wsSensitive = !!parent && parent.ns === 'html' && WS_SENSITIVE_TAGS.has(parent.tag.toLowerCase())
+  // 空白即内容的标签：拆分计划按 trimLayout 语义计算（裁首尾 ASCII 空白、保留
+  // U+00A0），会丢真内容空白，故含插值时强制 create 路径（preserveWs 不 trim）；
+  // 单占位符时计划复用原节点，把多段并成 1 个节点。
+  const wsSensitive = !!parent && WS_SENSITIVE_TAGS.has(parent.tag.toLowerCase())
   let prevText = false
   for (const nd of nodes) {
     if (nd.type === 'text') {

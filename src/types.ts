@@ -33,9 +33,6 @@ export interface CompiledStatic {
   /**
    * 静态视图产物。与 `noView` 构成**互斥二选一**，两者皆无会被运行时判为
    * 「未编译」并抛错（`CompElem.ts` setup 的第三分支）。
-   *
-   * ⚠️ 所以**缺席不代表无视图**：缺席是错误态，专留给「插件没跑 / 该有视图却没编出来」。
-   * 无视图组件必须由编译器显式写 `noView: true`。
    */
   buildTemplate?: (this: any) => BuiltTemplateResult
   /**
@@ -68,10 +65,6 @@ export interface CompiledStatic {
   /**
    * 无视图组件标记：render() 不存在 / 返回 null / 继承链终点为 CompElem（其
    * `render()` 返回 null）。注入后运行时不创建 Shadow DOM，仅支持 HOST/GLOBAL 样式。
-   *
-   * ⚠️ 与 `buildTemplate` 互斥，且**必须有** —— 缺席不等于无视图（见上）。
-   * 唯一豁免：继承链经 spread 从父类继承而来（`skipInjection`），以及
-   * `CompElem` 自身声明的本字段（运行时基类兜底，非编译器产物）。
    */
   noView?: boolean
 }
@@ -184,7 +177,6 @@ export interface CompilerOptions {
   /**
    * 参与编译的文件过滤。默认处理 `.ts`，且源码里出现 `extends CompElem`、`@tag(`
    * 或家族装饰器（@prop/@state/@computed/@query）之一。
-   * ⚠️ 不要放宽到 `.js`：IIFE 打包产物里指令名不在 scope，会触发 D3 误报。
    */
   include?: (id: string, code: string) => boolean
   /**

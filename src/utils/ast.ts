@@ -54,11 +54,6 @@ const CACHE = new Map<string, ParsedFile>()
 
 /**
  * FNV-1a 32 位字符串哈希（导出供 vite transform 缓存 key 用，U4）。
- *
- * ⚠️ 缓存 key 不能只用 `id + '::' + code.length`：同一路径下若源码变了但长度
- * 恰好相同（不同写法替换、测试用例复用同一 id），会命中旧 AST 返回错误结果。
- * 实测踩过：两个仅模板内容不同的 fixture 长度都是 39，V4 用例因此少报了违规。
- * 这里补一个轻量哈希（不引依赖），保证「同 id 不同源码」一定 miss。
  */
 export function hash32(s: string): string {
   let h = 0x811c9dc5

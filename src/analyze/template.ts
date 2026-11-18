@@ -157,7 +157,6 @@ export function d7IssuesAt(node: any, hAliases: Set<string>, out: TemplateIssue[
 /**
  * U5：在子树内收集全部 D7 违规（DFS 前序，与 collectTemplateIssues 单遍语义一致）。
  * analyzeRender 用它扫描「主 scan 不进入」的函数参数默认值区域，保持覆盖对等。
- * ⚠️ 不 return 于 h`` 节点：指令回调里的模板自身插值同样要检查（继续下钻）。
  */
 export function collectIssuesInSubtree(
   node: any,

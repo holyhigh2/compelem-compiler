@@ -83,11 +83,6 @@ export function scanJsText(src: string): JsTextScan {
         // 收尾引号算代码位置：让 "x"! 的 ! 仍可被 stripTs 识别
         mask[i] = 1
         stack.pop()
-        // ⚠️ 字符串是**值**，其后出现的 `/` 只能是除号（`'a' / 2`）。
-        // 不复位的话 regexAllowed 会保留进字符串之前的值（多数情况是 true），
-        // 下一个 `/` 被当成正则起点 ⇒ 把后面的代码整段屏蔽（2026-10-22 审查 C-6）：
-        //   `'a' / 2`           ⇒ rewriteThis 引号配对复检失败，合法 JS 被拒
-        //   `'a' / 2 + (this.n / 3)` ⇒ `this` 落在"正则内容"里漏改写 ⇒ 运行期静默错值
         regexAllowed = false
       }
       i++
@@ -283,12 +278,6 @@ export function codeOnly(src: string): string {
  */
 /**
  * `as` / `satisfies` 断言判据。
- *
- * ⚠️ 必须排除**成员访问**：`this.as (1)` / `x?.as (2)` 里的 `as` 是方法名而不是
- * 类型断言。旧判据只要求"词边界 + 后面是标识符/括号"，于是格式化工具把方法调用
- * 写成 `this.as (1)`（名字与 `(` 之间有空格）时被误报成"含 TS 专有语法"，
- * **合法 JS 直接构建失败**（2026-10-22 审查 C-8）。
- * `(?<![\w$.])` 同时挡掉 `obj.as`（前一个字符是 `.`，`?.` 亦然）与标识符内部。
  */
 const AS_SATISFIES_RE = /(?<![\w$.])(?:as|satisfies)\s+[A-Za-z_(<]/
 /** 后缀 `!` 候选：`x!` / `f(x)!` / `arr[0]!`，但排除 `!=`（不等运算符）。 */
@@ -319,11 +308,6 @@ export function hasTsSyntax(src: string): boolean {
  * 语义翻成 `typeof x`（且复检 `hasTsSyntax` 看不到被删的 `!`，不会报错）。
  * 同理 `for (const x of !list)`、`else !a && b()`：prelude 语句位与插值表达式
  * 同受保护，`of`/`in`/`else`/`do` 后的 `!` 也是一元，必须保留。
- *
- * ⚠️ **不含 `this` / `super`**：`this!.foo` / `super!.foo` 是合法的非空断言，要剥。
- * ⚠️ **不含 `instanceof`**：`x instanceof B!` 的 `!` 跟在右操作数 `B` 之后，是断言
- *    （要剥）；把 `instanceof` 加进来反而会把方向判错。只有关键字**后紧跟**的 `!`
- *    才是一元，`instanceof` 后一般是操作数不是 `!`。
  */
 const UNARY_BEFORE_BANG = new Set([
   'typeof', 'await', 'void', 'return', 'case', 'throw', 'delete', 'yield',
@@ -360,9 +344,6 @@ export function isUnaryKeyword(src: string, end: number): boolean {
  *
  * 只动 mask=1 的字符：字符串 / 模板文本 / 注释 / 正则里的 `#` 原样保留
  * （`const sel = "#a"` 不会被改成 `"a"`）。扫描未闭合时退回裸正则，与旧行为一致。
- *
- * ⚠️ 产物不走本函数：预置代码的落盘版本由 compile.ts 的 `rewriteThis(…, 'rc')`
- * 处理，`this.#x` → `rc.#x`，写在 `static __ce_static__` 的类体内，语法合法。
  */
 export function degradePrivateNames(src: string): string {
   if (src.indexOf('#') < 0) return src

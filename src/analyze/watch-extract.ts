@@ -51,12 +51,6 @@ export interface WatchExtractResult {
  * 生成 signal 模式 watch effect 工厂数组。
  * 每个 watch 条目 → `(rc) => effectFn`。
  *
- * ⚠️ 处理器实参必须与**库 API** 一致，本实现按下列权威来源对齐：
- *   - `compelem/README.md`「属性/状态监视」：
- *       `@watch("width", { immediate: true }) watchWidth(nv: string, ov: string, sourceName: string)`
- *   - `WatchHandler` 签名：
- *       `(newValue, oldValue, source: string, subNewValue?, subOldValue?) => any`
- *
  * 两个由此推出的语义要点：
  * 1. **每个 source 各自独立判定与独立调用**。多源 `@watch(['a','b'])` 时处理器被
  *    调用**多次**，每次带各自的 nv/ov/sourceName —— 靠 sourceName 区分是哪个源
@@ -116,19 +110,6 @@ export function generateWatchEffects(entries: WatchEntry[]): string {
         : `n[${i}] !== o[${i}]`
 /**
      * 变更回调：(nv, ov, sourceName)。
-     *
-     * ⚠️ **必须包 `untrack`**：这个调用发生在 effect 体**内部**（`CompElem.setup` 里
-     * `effect(factory(this))`），作者方法体里任何额外的信号读都会被 `track()` 收编成
-     * 本 watch 的依赖 —— 而本 watch 的订阅集本该**只含装饰器里声明的源**（`reads` 是
-     * 静态算出的）。例：
-     *
-     * ```ts
-     * @watch('a', 'aChanged')
-     * aChanged(nv) { this.a = nv; console.log(this.debugInfo) }  // debugInfo 被误订阅
-     * ```
-     *
-     * 方法体对 codegen 是黑盒（用户代码），无法静态剔除里面的读，故在调用点整体
-     * 关闭收集。这是 `untrack` 唯一的内部使用点，也是它存在的理由。
      */
     const call = (i: number) => `untrack(() => ${recv}.${name}(n[${i}], o[${i}], ${stringify(sources[i])}))`
     /** immediate 前奏：ov 此刻尚不存在，按 API 传 undefined */
@@ -290,11 +271,6 @@ export function lineSpan(code: string, start: number, end: number): { start: num
 /**
  * 提取组件类上全部 @watch 配置。错误（E-WATCH-ARG / E-WATCH-SOURCE）与条目互斥：
  * 有错误时调用方应放弃删除与注入（运行时装饰器路径兜底）。
- *
- * ⚠️ **继承**：条目里会**先并入同文件基类链上的 @watch**（祖先在前），因为
- * `watchEffects` 是按 `(this.constructor).__ce_static__` 逐实例取的 —— 子类若只
- * 注入自己的 watch，父类实例上的处理器在子类实例上就完全不生效。
- * 顺序「祖先在前」使父类处理器先于子类触发。
  *
  * 只并入**条目**，不并入 removals：祖先在 analyzeFile 里是独立组件，删自己的装饰器。
  */

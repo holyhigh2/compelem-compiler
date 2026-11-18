@@ -271,9 +271,6 @@ function applyLevel(
  * ⇒ **整个 cssVars 退到运行期全根兜底**。而 `slots` 恰恰是响应式的
  * （`CompElem.#slotsSig()` → `s.slots = signal(...)`，CompElem.ts:1005-1006），
  * 静态完全可定 —— 不该为一个已知信号付出「每轮遍历并订阅全部信号」的代价。
- *
- * ⚠️ 只收**确实落在 `__s` 上**的键。`@query`/`@queryAll` 不是信号，绝不能进来 ——
- * 那类根由 ② 级（`queryFields`）负责，记为「死条目」，codegen 侧用 `?.` 兜住。
  */
 const BASE_SIGNAL_ROOTS: ReadonlySet<string> = new Set(['slots'])
 

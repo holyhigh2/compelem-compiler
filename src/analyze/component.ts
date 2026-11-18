@@ -137,12 +137,6 @@ export interface ClassInfo {
 
 /**
  * compelem 导入名解析器：**本地名 → 导入原名**（`import { prop as p }` ⇒ `p` ⇒ `'prop'`）。
- *
- * ⚠️ 不得再用「导入名集合 + 本地名比对」的写法（`aliases.has(localName)`）：
- * 本地名与导入原名只在**未取别名**时相等。`import { prop as p }` 下
- * `aliases.has('p')` 为假 ⇒ `@prop` 不被识别、类不被判为组件 ⇒ prop 静默退化成
- * 普通实例字段（运行时装饰器是 no-op，全程无任何报错兜底）。
- * 一律用解析器判「这个装饰器/基类名是不是 compelem 的 X」。
  */
 export type ImportResolver = (local: string) => string | undefined
 
@@ -417,10 +411,6 @@ export function collectMixinClasses(parsed: ParsedFile, resolve: ImportResolver)
 // 但 8 个调用点早已各自内联同一表达式（`conventions.ts:367`、`deps-extract.ts:287`、
 // `field-extract.ts:141/178`、`template-rules.ts:79/111`、`watch-extract.ts:270`、
 // `compile.ts:322`），全仓零调用。
-//
-// ⚠️ 内联时必须保留 `comp.cls ?? localClasses.get(comp.className)` 这个**双通道**：
-// 只按名查 `localClasses` 只收模块顶层的 `ClassDeclaration`，mixin 工厂内的函数作用域类
-// 按名查不到 → `field-extract` 等会拿到 undefined 而**静默不提取**。
 
 /**
  * 分析单个源文件，返回所有 compelem 组件类的信息。

@@ -41,62 +41,9 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const preludeNameRe = (name: string): RegExp =>
   new RegExp(`(?<![\\w$])${escapeRe(name)}(?![\\w$])`)
 
-/**
- * ⚠️⚠️ **工厂隐式形参名必须不可能与用户标识符撞名。**
- *
- * 工厂体里内联的是**用户源码**（只把 `this` 重写成 `rc`，其余原样保留），因此用户
- * 完全可以在模板插值里调用模块级函数。历史形态把第 3/4 个形参命名为 `get` / `dep`：
- *
- * ```ts
- * // 用户源码
- * import { get } from 'myfx'
- * h`<span title="${this.labelMap.get(f) + ' - ' + get(data, [f])}"></span>`
- *
- * // 旧 codegen 产物（形参 get 与模块级 get 同名 ⇒ 用户那次调用被解析成形参）
- * pe: [(rc, nodes, get, dep, ov, f) => () => { const a5 = rc.labelMap.get(f) + ' - ' + get(data, [f]); … }]
- * ```
- *
- * JS 词法作用域下那个 `get(data, [f])` 绑到**形参**，而运行期在子视图路径上第 3/4
- * 实参**恒为 `undefined`**（`render.ts` 的 `registerSubViewEffects`：
- * `(curPe[0])(component, nodes, undefined, undefined, ov, …)`）⇒ 首次求值即
- * `TypeError: get is not a function`。经 esbuild 做作用域改名后报错变成
- * `get4 is not a function`，且模块里的 `import { …, get, … }` 会被判定「未被引用」
- * 而删掉 —— 现象上完全看不出与「形参撞名」有关（2026-10-09 实测于 `Board.ts` /
- * `BoardBar.ts`，esbuild 产物里 0 处 `get4` 声明）。
- *
- * 这两个形参**从未被运行期赋过真值**：`render.ts` / `buildStaticView` 的注释原话是
- * 「每个点的取值表达式都内联在 fx 工厂里，工厂不需要额外的取值解析实参」，保留它们
- * 只为与运行期调用点保持**位置**稳定（第 1/2/5 位才是 rc / nodes / ov）。因此改名
- * 是纯粹的 codegen 内部行为，不触及任何运行期约定。
- *
- * 运行时 helper（`wText`/`execDir`/…）与 `rc` / `nodes` / `ov` 三个真正被生成的代码
- * 读写的名字不动：它们紧邻形参表前部，用户回调形参排在后面（`paramsCode` 追加），
- * 真要撞就是**重复形参名**（ES module 严格模式下直接 SyntaxError），早就在构建期暴露。
- */
 const P_GET = '__ceGet'
 const P_DEP = '__ceDep'
 
-/**
- * ⚠️⚠️ **工厂体内生成的局部名同样必须不可撞名。**
- *
- * 与上面形参名同一类事故，但更隐蔽（2026-10-22 审查 C-1 实证）：
- *
- * ```ts
- * render() { const a = this.n; return h`<div>${show(a > 0)}</div>`; }
- * // 产物：const a = rc.n;            ← prelude 原样注入
- * //       const a = (show(a > 0));  ← 指令工厂的局部名
- * //       ⇒ SyntaxError: Identifier 'a' has already been declared（整模块加载失败）
- *
- * render() { const ov = this.n; return h`<div>${ov.length}</div>`; }
- * // 产物：let ov; … const ov = rc.n;  ← 用户 prelude 遮蔽了旧值槽
- * //       ⇒ 守卫比的是 `ov.length` 与 `ov`；末尾 `ov = nv` 给 const 赋值
- * //       ⇒ 每轮 effect 抛 TypeError，文本永不更新（异常被隔离，最难查）
- * ```
- *
- * 注意 `const ov` 这一类**不会被形参表暴露**：prelude 注入在 effect **体内**，
- * 而 `ov` 声明在工厂体外层，属于"内层遮蔽外层"——不报重复声明，只是静默用错。
- * 因此三处局部名（旧值 / 新值 / 点值）一律走 `__ce` 前缀。
- */
 const L_OLD = '__ceOv'
 const L_NEW = '__ceNv'
 /** 点值局部名（子模板按点序号编号，避免同一函数体内重复声明）。 */
@@ -232,12 +179,6 @@ export function signalExprFor(
     if (m) {
       // m[1] 以 '.' 开头（".a.b"），先去掉再切分，否则 root 会变成空串
       const segs = m[1].slice(1).split('.')
-      // ⚠️ 根必须是**真信号键**。`__s` 只装 @prop/@state/@computed 的键
-      // （field-extract 注入的 fieldInits）+ 框架自带的 `slots`；普通实例字段、
-      // `@query` 查询属性都不在其中。对它们内联出 `rc.__s.x.value` 会在
-      // effect 首次执行时抛 `Cannot read properties of undefined (reading 'value')`，
-      // 且因 field-extract 视其为「保守收录」而无任何诊断。
-      // 非信号根一律退回 `get(i)`，由访问器按真实语义取值。
       if (segs.length && segs[0] && signalKeys.has(segs[0])) {
         const root = segs[0]
         const rest = segs.slice(1)
@@ -396,11 +337,6 @@ export function generateRenderEffect(
       continue
     }
     const value = signalExprFor(up.varIndex, varIndexToExpr, signalKeys)
-    // ⚠️ 只在 signalExprFor 退回 `get(vi)` 时才需要内联。若它已经给出
-    // `rc.__s.<k>.value`，就必须用那个 —— 访问器 `rc.a` 只差一次调用，但
-    // signalExprFor 里那道根信号校验（普通实例字段 / @query 不在 __s 里，
-    // 内联出 __s 会抛 undefined.value）就不能生效了。
-    // 顺带省掉一次源码切片与改写（内联不是廉价的）。
     const usesGet = value.startsWith('get(')
     const inlined = usesGet ? inlineExprFor(up.varIndex, varIndexToExpr, ictx) : null
     // 退回 get(vi) 时**必须**置位：用于触发构建期报错；漏置位会产出含未解析
@@ -542,8 +478,6 @@ export function generateSubInlinedEffect(
   const fxSig = `(rc, nodes, ${P_GET}, ${P_DEP}${paramsCode})`
   // 合并 effect 工厂额外多一个**外部传入**的旧值槽数组 ov：工厂在 effect 体**每轮**被
   // 调用（item 实参读 cell.value → 订阅 + 当前值），ov 必须跨轮持久，由运行时提供。
-  // ⚠️ 形参名必须不可撞名（见 `L_OLD` 注释）：子模板回调形参由 `paramsCode` 追加在
-  // 后面，叫 `ov` 的用户形参会让整个合并工厂直接 SyntaxError（重复形参）。
   const peSig = `(rc, nodes, ${P_GET}, ${P_DEP}, ${L_OLD}${paramsCode})`
   /**
    * 表达式是否引用 `prelude` 里声明的局部变量。
@@ -572,12 +506,6 @@ export function generateSubInlinedEffect(
     !!preludeRes && preludeRes.some((re) => re.test(src))
   /**
    * `fx` 工厂体化：表达式引用 prelude 变量时把 prelude 注入工厂体再 `return`。
-   *
-   * ⚠️ 必须写成**块体**（`{ prelude; return (expr) }`）而不是默认参数或逗号表达式 ——
-   * prelude 是多语句声明序列（`const` 必须处于块作用域），且事件点形态
-   * `() => navigator.clipboard?.writeText(svgName)` 需要靠这层块作用域让内层箭头
-   * **闭包捕获** `svgName`（否则点击时同样 ReferenceError）。
-   * 未引用 prelude 的工厂保持原样（单表达式箭头），不引入多余块作用域。
    */
   const fxOf = (sig: string, body: string): string =>
     usesPrelude(body) ? `${sig} => { ${prelude}\nreturn (${body}) }` : `${sig} => (${body})`

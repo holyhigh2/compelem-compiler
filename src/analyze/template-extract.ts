@@ -510,17 +510,6 @@ export function extractMainTemplate(
       preludeSrc = source.slice(preludeStart, preludeEnd)
     } else if (retIdx < 0) {
       // return 不是 render() 的**直接**顶层语句（被 if / for / switch 包住）。
-      //
-      // ⚠️ 这里必须报错，不能"取前置语句当 prelude 然后继续"（2026-10-22 审查 C-4）：
-      // ```ts
-      // render() { if (this.n) { return h`<div>${this.n}</div>` } }
-      // ```
-      // `topLevelReturns` 会下钻块语句 ⇒ rets.length === 1 ⇒ 过 D5；retNode 也匹配上
-      // ⇒ 过 D8。结果 buildTemplate 无条件建 `<div>`、fx 无 `if (rc.n)` 守卫 ⇒
-      // **n = 0 时照样渲染**，编译零诊断。而注释明写 D8 就是要防"条件被整体丢弃"。
-      //
-      // 只对**能跳过 return** 的宿主语句报（条件 / 循环 / switch）：裸块 `{ return h`` }`
-      // 与 try/finally 里的 return 不会丢条件，继续按老逻辑取 prelude。
       const hostIdx = stmts.findIndex(
         (s: any) => typeof s.start === 'number' && s.start <= tmpl.start && tmpl.end <= s.end,
       )

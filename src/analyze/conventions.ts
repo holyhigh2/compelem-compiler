@@ -693,9 +693,6 @@ export function checkConventions(
    * prop 赋值，只查本类 propFields 会漏报。沿 extends 链上溯同文件基类
    * （跨文件基类不可知，保持漏报不误报），浅替换语义——子类同名字段的选项
    * 对象整体覆盖祖先（先放本类，祖先仅在无同名时补入）。
-   * ⚠️ 只用于 propAssignments 判定；成员级检查（E-PROP-CASE/TYPE 等）仍用
-   * 本类 propFields——那是按「本类成员自带 @prop」遍历的，混入祖先字段会
-   * 把子类同名的普通字段误当 prop 检查。
    */
   const propFieldsChain = new Map<string, any>(propFields)
   {

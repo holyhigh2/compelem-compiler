@@ -38,11 +38,13 @@ import {
   type TAttr,
   type TElement,
   type TNode,
+  type TPart,
   type TText,
   type TVarPart,
 } from '../analyze/template-tree'
 import { camelCase, kebabCase, snakeCase } from 'myfx'
 import { isCustomTag, stringify } from '../utils/ast'
+import { trimLayout } from '../utils/entities'
 import { canUseInnerHTML, serializeTemplateHTML } from './template-html'
 
 const BUILTIN_DIRECTIVES = COMpelem_DIRECTIVES
@@ -115,10 +117,17 @@ interface Ctx {
   /** innerHTML 快路径（序列化进 HTML 串，body 只发射 ee/tc 行与 walk） */
   html: boolean
   /**
+   * innerHTML 快路径的文本拆分计划（文档序，每个含插值的文本节点一条）。
+   * 条目 = 扁平数组：`[start,end]` 对为静态段（相对解析后文本数据的偏移，已 trim），
+   * `-1` 为空占位符节点；标量 `-1` = 整段恰为单占位符（复用原节点、data 置空）。
+   * 与 emitText 的分段分配**同一循环**产出，构造上保证两条建树路径逐段一致。
+   */
+  splitPlan: (number | number[])[]
+  /**
    * nodeSn → 从 fragment 根到该节点的 childNodes 下标链（编译期静态计算）。
    *
    * html 与 create 两条建树路径的**最终** DOM 结构一致，故路径唯一：html 快路径的
-   * 文本占位符拆分（walkSplitText）产出的分段数，与 emitText 的 nodeSn 分配严格一一对应。
+   * 文本拆分计划（splitPlan）与 emitText 的 nodeSn 分配同循环产出，分段数严格一一对应。
    * 只有 `needed` 集合里的路径会进产物（其余编译期丢弃，避免产物膨胀）。
    */
   paths: Map<number, number[]>
@@ -178,6 +187,7 @@ export function generateBuildTemplate(
     ups: [],
     nodeNames: [],
     html,
+    splitPlan: [],
     paths: new Map(),
     needed: new Set(),
     upIndexOf,
@@ -213,7 +223,10 @@ export function generateBuildTemplate(
   const updateSnsField = `const updateSns = [${sns.join(', ')}];`
   const updatePathsField = `const updatePaths = [${sns.map(sn => `[${(ctx.paths.get(sn) ?? []).join(', ')}]`).join(', ')}];`
   const bodyLines = [...ctx.L]
-  if (html) bodyLines.push(...WALK_LINES)
+  if (html) {
+    bodyLines.push(`const splitPlan = ${JSON.stringify(ctx.splitPlan)};`)
+    bodyLines.push(...WALK_LINES)
+  }
   bodyLines.push(`const ups = [${upsFields.join(', ')}];`)
   bodyLines.push(updateSnsField)
   bodyLines.push(updatePathsField)
@@ -241,20 +254,26 @@ ${ret}`
 }
 
 /**
- * innerHTML 快路径的文本拆分 + 文档序收集。
+ * innerHTML 快路径的文档序收集 + 文本拆分。
  *
- * 这段约 1.2 KB 的自包含 walk 若**逐模板内联**生成（主模板 + 每个子模板各一份），
- * 是产物体积最大的单项浪费（实测 10 组件 × 3 子模板 = 20 份完全相同、minifier 无法去重的
- * 函数体，合计占产物 34.5%）。故提到运行时 `render.ts` 的 `walkSplitText`，
- * 产物只剩一行调用。
+ * 拆分**语义**（trimLayout、分段、空段丢弃）全部在编译期由 emitText 同一循环
+ * 算成 `splitPlan`（偏移量计划，不重复文本字节）；运行期 `_ceWalkSplit` 只做
+ * 机械切片与收集，不含正则/trim。这段 walk 若逐模板内联生成是产物体积最大的
+ * 单项浪费（实测 10 组件 × 3 子模板 = 20 份相同函数体，占产物 34.5%），故留在
+ * 运行时共享，产物只剩一行调用 + 一个计划字面量。
  *
  * `buildTemplate` / `subViews[id].buildTemplate` 均以 `.call(component)` 调用，
  * 故 `this` 恒为组件实例，用实例方法 `_ceWalkSplit` 转发，产物无需引入自由标识符。
  *
- * ⚠️ 位置敏感：walk 必须排在 `ups` 字面量折叠之前、且 push 序与编译期分配的 `nodeSn`
- * 严格一一对应（这是 `canUseInnerHTML` 保守性的依据）。改动请勿调整调用位置。
+ * 契约守卫（双向握手的产物侧）：旧运行时的 `_ceWalkSplit(f, nodes)` 只有两参，
+ * 会**静默忽略** splitPlan 并按旧语义自行 trim/拆分（含 U+00A0 误删）。产物在调用前
+ * 校验方法元数，不匹配即抛可读错误。反方向（旧产物 + 新运行时）由运行时
+ * `walkSplitText` 的 plan 缺失守卫兜住。元数即契约版本，无需额外标记字段。
  */
-const WALK_LINES: string[] = ['this._ceWalkSplit(f, nodes);']
+const WALK_LINES: string[] = [
+  'if (this._ceWalkSplit.length !== 3) throw new Error("[compelem] splitPlan artifact requires a newer compelem runtime (three-arg _ceWalkSplit); upgrade compelem");',
+  'this._ceWalkSplit(f, nodes, splitPlan);',
+]
 
 // ---------- 节点发射 ----------
 
@@ -265,9 +284,10 @@ function emitNode(
   parentPath: number[],
   sib: { i: number },
   parentTag?: string,
+  parentNs?: string,
 ) {
   if (nd.type === 'element') emitElement(ctx, nd, parentVar, parentPath, sib)
-  else if (nd.type === 'text') emitText(ctx, nd, parentVar, parentPath, sib, parentTag)
+  else if (nd.type === 'text') emitText(ctx, nd, parentVar, parentPath, sib, parentTag, parentNs)
   else emitComment(ctx, nd, parentVar, parentPath, sib)
 }
 
@@ -306,12 +326,12 @@ function inlineStaticFragments(
 
   const inlineText = (nd: TText): TNode[] | undefined => {
     if (!nd.parts.some((p: any) => p.type === 'var')) return undefined
-    const parts = splitParts(nd.raw.trim())
+    const parts = splitParts(trimLayout(nd.raw))
     const out: TNode[] = []
     let sawFragment = false
     for (const p of parts) {
       if (p.type === 'static') {
-        const t = p.text.trim()
+        const t = trimLayout(p.text)
         if (!t) continue
         out.push({ type: 'text', raw: t, parts: [{ type: 'static', text: t }] })
         continue
@@ -388,7 +408,7 @@ function emitElement(ctx: Ctx, el: TElement, parentVar: string, parentPath: numb
   if (ctx.html) {
     // 元素已在 HTML 串中：只走编号/属性 up 收集，不发射创建与 append 行
     for (const a of el.attrs) emitAttr(ctx, el, a, sn, '')
-    for (const c of el.children) emitNode(ctx, c, parentVar, myPath, childSib, el.tag.toLowerCase())
+    for (const c of el.children) emitNode(ctx, c, parentVar, myPath, childSib, el.tag.toLowerCase(), el.ns)
     if (isComp) ctx.slotStack.pop()
     return
   }
@@ -405,8 +425,42 @@ function emitElement(ctx: Ctx, el: TElement, parentVar: string, parentPath: numb
 
   ctx.L.push(`${parentVar}.appendChild(${v});`)
 
-  for (const c of el.children) emitNode(ctx, c, v, myPath, childSib, el.tag.toLowerCase())
+  for (const c of el.children) emitNode(ctx, c, v, myPath, childSib, el.tag.toLowerCase(), el.ns)
   if (isComp) ctx.slotStack.pop()
+}
+
+/**
+ * 含插值文本的拆分计划条目（innerHTML 快路径用）。
+ *
+ * `whole` 与 `parts` 由 emitText 直接传入，本函数只算偏移——不再自行
+ * `trimLayout + splitParts`，避免与 emitText 的分段语义出现两套派生逻辑。
+ * 语义与 emitText 的分段循环逐字同义：整体 trimLayout → 静态段 trimLayout、
+ * 空段丢弃、占位符为空文本节点。偏移相对**解析后的文本数据**——canUseInnerHTML
+ * 契约保证它逐字等于 nd.raw（无 \r、无相邻文本合并、实体已在编译期解码）。
+ * html 模式下 preserveWs 文本必被 canUseInnerHTML 拒绝，故无需处理空白敏感分支。
+ */
+function splitPlanEntryOf(raw: string, whole: string, parts: TPart[]): number | number[] {
+  if (parts.length === 1 && parts[0].type === 'var') return -1
+  // whole 是 raw 去掉首尾布局空白后的子串（html 模式必非 preserveWs），
+  // 故 whole 在 raw 中的起点就是首部空白长度；不用再算一遍 leading-trim。
+  const lead = raw.indexOf(whole)
+  const entry: number[] = []
+  let cursor = 0
+  for (const p of parts) {
+    if (p.type === 'var') {
+      entry.push(-1)
+      cursor += PLACEHOLDER.length + String(p.index).length
+      continue
+    }
+    const t = trimLayout(p.text)
+    if (t) {
+      const ls = p.text.length - p.text.replace(/^[\t\n\f\r ]+/, '').length
+      const start = lead + cursor + ls
+      entry.push(start, start + t.length)
+    }
+    cursor += p.text.length
+  }
+  return entry
 }
 
 function emitText(
@@ -416,6 +470,7 @@ function emitText(
   parentPath: number[],
   sib: { i: number },
   parentTag?: string,
+  parentNs?: string,
 ) {
   const hasVar = nd.parts.some((p: any) => p.type === 'var')
 
@@ -433,25 +488,25 @@ function emitText(
   }
 
   // 有插值：整体 trim 后分裂（静态片段 trim、空白片段丢弃、占位符为空文本节点）。
-  // 每个分段占一个 childNodes 位；分段数与运行时 walkSplitText 严格一致（见 canUseInnerHTML 契约）。
-  //
-  // ⚠️ rawtext 系 / `<pre>` 下**不能 trim**（2026-10-22 审查 C-7）：那里的空白与换行
-  // 就是内容本身。此前无条件 trim ⇒ `h`<pre>\n  line1\n  ${n}\n  line3\n</pre>`` 的
-  // 缩进换行全丢（产物只剩 "line1" / "" / "line3"），而 parse 阶段的 prune 明写
-  // "rawtext 系空白是真内容、一律不动" —— 两个阶段口径必须一致。
+  // 每个分段占一个 childNodes 位；html 模式同循环产出 splitPlan，运行期按计划切片。
   const preserveWs = !!parentTag && WS_SENSITIVE_TAGS.has(parentTag)
-  let whole = preserveWs ? nd.raw : nd.raw.trim()
+  let whole = preserveWs ? nd.raw : trimLayout(nd.raw)
   if (preserveWs) {
-    // HTML 解析器在 <pre>/<textarea> 起始标签后会吃掉**一个**换行；
-    // create 路径没有解析器，这里手动对齐，保证两条建树路径产物一致。
-    if (whole.startsWith('\r\n')) whole = whole.slice(2)
-    else if (whole.startsWith('\n')) whole = whole.slice(1)
+    // HTML 解析器只在 **HTML 命名空间的 pre/listing/textarea** 起始标签后吃掉一个
+    // 前导 LF；title（RCDATA）与 script/style/xmp（RAWTEXT）不吃，SVG 下更不吃。
+    // create 路径没有解析器，这里仅对这三个标签手动对齐，其余一律保留首换行。
+    if (parentNs === 'html' && (parentTag === 'pre' || parentTag === 'listing' || parentTag === 'textarea')) {
+      if (whole.startsWith('\r\n')) whole = whole.slice(2)
+      else if (whole.startsWith('\n')) whole = whole.slice(1)
+    }
   }
   const parts = splitParts(whole)
+  // 拆分计划与分段分配同循环产出：运行期 walk 只按计划切片，不再做任何语义决策
+  if (ctx.html) ctx.splitPlan.push(splitPlanEntryOf(nd.raw, whole, parts))
 
   for (const p of parts) {
     if (p.type === 'static') {
-      const t = preserveWs ? p.text : p.text.trim()
+      const t = preserveWs ? p.text : trimLayout(p.text)
       if (!t) continue
       const sn = ctx.nodeSn++
       ctx.nodeNames.push('#text')
@@ -610,8 +665,6 @@ function emitAttr(ctx: Ctx, el: TElement, a: TAttr, sn: number, elVar: string) {
       up.attrName = normalizeAttrName(el.ns, name, el.tag.toLowerCase(), ctx.opts.knownTags)
       up.attrTmpl = attrTmplOf(a)
       // isPureTmpl：value === PLACEHOLDER + varIndex（upm 序严格相等）。
-      // ⚠️ 比较的是 var 的**ups 序**下标，不是 `vps[0].index`（模板序）：
-      // 片段 var（`${html(CONST)}`）不占 varIndex，两序会错开。
       up.isPureTmpl = a.parts.length === 1 && ctx.upIndexOf.get(vps[0].index) === up.varIndex
     }
     pushUp(ctx, up)

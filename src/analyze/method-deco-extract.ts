@@ -22,23 +22,6 @@
  *   ⇒ 构造体：const __f2 = this.init.bind(this); this.init = once(__f2); this.init_$__ = __f2
  *   ⇒ destroy：this.init = () => {}; this.init_$__ = () => {}
  *
- * ⚠️ destroy 里**置空操作函数而非 null**：库里存在若干「一次性定时器 / 手工 debounce」
- * 的迟到回调，会在组件销毁后仍直接 `this.decoMethod()`。若置 null 会抛
- * "X is not a function"；置 no-op 则静默无害（这些方法本就只在存活期有意义）。
- * 注意 no-op 是**真值**（null 是假值），故不要依赖销毁后 `if (this.X)` 为假。
- *
- * ⚠️ **三个装饰器的 `_$__` 语义各不相同**（已实测确认）：
- *   - debounced：包裹 **guard**（含 isDestroyed），`_$__` **也是 guard**
- *   - throttled：包裹**原函数**（无 guard），`_$__` 是**原函数**
- *   - onced：包裹 `once(base)`，`_$__` 是 **bind 后**的原函数
- *   ⇒ 注入代码必须按类型分支，**不能统一写法**。
- *
- * ⚠️ **必须先把原型方法捞进临时变量**（`const __f = this.onX`）：包装后
- * `this.onX` 即指向包装结果，再取就是递归。
- *
- * ⚠️ **继承**：只处理**本类 own** 的装饰器。祖先的 constructor 已经执行过自己的
- * 包装注入；子类再注入一遍会造成 debounce/throttle 双层包装与 _$__ 覆盖。
- *
  * **逐族 all-or-nothing + 失败即报错**：任一成员参数不可静态解析 → 该族整体
  * 不删不注并报 E 码。运行时装饰器已无定义路径，E 码是唯一保护。
  */
@@ -95,9 +78,6 @@ export function extractMethodDecos(
 
   /**
    * 解析 `wait`：数字字面量（含一元负号）/ 模块级 `const` 数字。
-   * ⚠️ ESTree 形态 —— 是 `Literal` + `value`，**不是** `NumericLiteral`。
-   * 故必须用 literal-meta 的判定函数，不能直接比 `type === 'NumericLiteral'`
-   * （曾因此让 `@debounced(50)` 全部误报 E-METHOD-DECO-ARG）。
    */
   const resolveWait = (arg: any): number | null => {
     if (!arg) return null
@@ -255,11 +235,6 @@ export function extractMethodDecos(
   // 再注入一遍会造成 debounce(throttle) 双层包装与 _$__ 覆盖。
   collect(cls)
 
-  // ⚠️ 用户已声明 own `beforeDestroyed` ⇒ **整体放弃前移并报 E 码**。
-  // 原因：清理语句要注入成一个 `beforeDestroyed()` 重写，若用户已有一个，注入会
-  // 产生重复方法定义（后者覆盖前者 → 用户逻辑静默丢失）。而"只跳过清理、保留包装"
-  // 会造成包装了却永不 cancel 的泄漏 —— 比不包装更难查。故与其它失败一样走
-  // all-or-nothing（不删不注 + E 码阻断）。
   if (!failed && result.ctorStmts) {
     const dup = (cls.body?.body ?? []).find(
       (m: any) => m.type === 'MethodDefinition' && m.static !== true && keyName(m.key) === 'beforeDestroyed',
