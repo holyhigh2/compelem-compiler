@@ -3,7 +3,8 @@
  *
  * 编译期覆盖以下约定检查：
  *   E-PROP-INTERP   .prop 的值必须是插值
- *   E-DIRECTIVE-DUP  同一元素上同一种指令只允许出现一次
+ *   E-DIRECTIVE-DUP  同一元素上同一种指令只允许出现一次（含自定义指令）
+ *   E-EVENT-DUP  同一元素上同一事件名只允许一条绑定（修饰符不区分）
  *   E-MUTATE-MODIFIER  @mutate 必须带 attr/child/char/tree 类型修饰符
  *   E-EVENT-FN      事件处理器必须是函数/成员
  *   E-EVENT-MODIFIER  非键盘事件上出现了不会生效的修饰符（运行期会被当成按键名过滤）
@@ -24,12 +25,12 @@
  * 错误定位统一挂在模板字面量整体（start/end = 模板源码区间），明细在 message 中。
  */
 import type { ComponentAnalysis } from '../types'
-import { decoratorName, isCustomTag, keyName, superClassName, thisChain, THIS_MEMBER_RE } from '../utils/ast'
-import type { TemplateTree, TElement, TNode } from './template-tree'
-import type { MainTemplate, TemplateVarInfo } from './template-extract'
+import { decoratorName, isCustomTag, keyName, superClassName, THIS_MEMBER_RE, thisChain } from '../utils/ast'
 import type { ConventionsContext } from './conventions'
 import { bodyReturnsTemplate, unwrapTsExpr } from './conventions'
 import { collectTemplateTagAliases } from './template'
+import type { MainTemplate, TemplateVarInfo } from './template-extract'
+import { PLACEHOLDER_FIRST_RE, type TElement, type TemplateTree, type TNode } from './template-tree'
 
 /** knownTags 缺省（无同文件 @tag 登记）时的空集——isCustomTag 需要恒有 .has。 */
 const EMPTY_TAG_SET: ReadonlySet<string> = new Set<string>()
@@ -571,7 +572,7 @@ export function checkTemplateRules(
     for (const a of el.attrs) {
       if (a.name.includes('⟬')) {
         // 属性名整体插值 = TAG 指令位
-        const m = /⟬Ċ⟭(\d+)/.exec(a.name)
+        const m = PLACEHOLDER_FIRST_RE.exec(a.name)
         if (m) varPosMap.set(+m[1], 'tag')
       }
     }
@@ -643,24 +644,45 @@ export function checkTemplateRules(
 
   for (const el of elements) {
     // ---- E-DIRECTIVE-DUP：同一元素上同一种指令只允许出现一次 ----
-    // 运行期按指令名收集 var，重复时后者直接覆盖前者且不报错，表现为「写了两个只有一个生效」。
-    // TAG 位指令写成属性名整插值（`<div ${show(a)} ${show(b)}>`），在 TAttr.name 里是 ⟬Ċ⟭N 占位符。
+    // TAG 位指令写成属性名整插值（`<div ${show(a)} ${show(b)}>`），在 TAttr.name 里是 ⟬ĊN⟭ 占位符。
+    // 自定义指令（moduleBindingName，标签位函数值即指令）按调用名同样查重。
     const seenDirectives = new Set<string>()
     for (const a of el.attrs) {
       if (!a.name.includes('⟬')) continue
-      const dm = /⟬Ċ⟭(\d+)/.exec(a.name)
+      const dm = PLACEHOLDER_FIRST_RE.exec(a.name)
       if (!dm) continue
       const dv = tmpl.vars[+dm[1]]
-      if (!dv?.isDirectiveCall || !dv.directiveName) continue // 自定义指令 → 放行
-      if (seenDirectives.has(dv.directiveName)) {
+      const dvName = dv?.directiveName || dv?.moduleBindingName
+      if (!dvName) continue
+      if (seenDirectives.has(dvName)) {
         errs.push({
           ...pos,
           message:
-            `E-DIRECTIVE-DUP: 元素 <${el.tag}> 上的指令 '${dv.directiveName}' 出现了两次以上；` +
-            `同一元素每种指令只能写一次（重复的那份运行期会被静默丢弃）`,
+            `E-DIRECTIVE-DUP: 元素 <${el.tag}> 上的指令 '${dvName}' 出现了两次以上；` +
+            `同一元素每种指令只能写一次`,
         })
       } else {
-        seenDirectives.add(dv.directiveName)
+        seenDirectives.add(dvName)
+      }
+    }
+
+    // ---- E-EVENT-DUP：同一元素上同一事件名只允许一条绑定 ----
+    // 修饰符不区分：@click.stop 与 @click.prevent 同为 click，@mutate.attr 与 @mutate.tree 同为 mutate。
+    // 动态路径（@event）编译期不可见，运行期保持原生多监听语义。
+    const seenEvents = new Set<string>()
+    for (const a of el.attrs) {
+      if (!a.name.startsWith('@')) continue
+      const evName = a.name.slice(1).split('.')[0].toLowerCase()
+      if (!evName) continue
+      if (seenEvents.has(evName)) {
+        errs.push({
+          ...pos,
+          message:
+            `E-EVENT-DUP: 元素 <${el.tag}> 上事件 '${evName}' 绑定了多次；` +
+            `同一元素每个事件名只允许一条绑定`,
+        })
+      } else {
+        seenEvents.add(evName)
       }
     }
 

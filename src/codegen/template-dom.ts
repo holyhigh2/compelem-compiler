@@ -28,7 +28,7 @@ import { COMpelem_DIRECTIVES } from '../analyze/render-body'
 import { normalizeAttrName } from './attr-name'
 import { varsByUpIndex, type TemplateVarInfo } from '../analyze/template-extract'
 import {
-  PLACEHOLDER,
+  placeholderOf,
   PLACEHOLDER_ONLY_RE,
   SVG_NS,
   WS_SENSITIVE_TAGS,
@@ -156,7 +156,7 @@ function varPartsOf(a: TAttr): TVarPart[] {
 
 /** attrTmpl：token 保留 Template 序编号（编号无语义影响）。 */
 function attrTmplOf(a: TAttr): string {
-  return a.parts.map(p => (p.type === 'static' ? p.text : PLACEHOLDER + p.index)).join('')
+  return a.parts.map(p => (p.type === 'static' ? p.text : placeholderOf(p.index))).join('')
 }
 
 export function generateBuildTemplate(
@@ -349,7 +349,7 @@ function inlineStaticFragments(
         }
         continue
       }
-      out.push({ type: 'text', raw: PLACEHOLDER + p.index, parts: [{ type: 'var', index: p.index }] })
+      out.push({ type: 'text', raw: placeholderOf(p.index), parts: [{ type: 'var', index: p.index }] })
     }
     return sawFragment ? out : undefined
   }
@@ -449,7 +449,7 @@ function splitPlanEntryOf(raw: string, whole: string, parts: TPart[]): number | 
   for (const p of parts) {
     if (p.type === 'var') {
       entry.push(-1)
-      cursor += PLACEHOLDER.length + String(p.index).length
+      cursor += placeholderOf(p.index).length
       continue
     }
     const t = trimLayout(p.text)
@@ -664,7 +664,7 @@ function emitAttr(ctx: Ctx, el: TElement, a: TAttr, sn: number, elVar: string) {
     } else {
       up.attrName = normalizeAttrName(el.ns, name, el.tag.toLowerCase(), ctx.opts.knownTags)
       up.attrTmpl = attrTmplOf(a)
-      // isPureTmpl：value === PLACEHOLDER + varIndex（upm 序严格相等）。
+      // isPureTmpl：value === placeholderOf(varIndex)（upm 序严格相等）。
       up.isPureTmpl = a.parts.length === 1 && ctx.upIndexOf.get(vps[0].index) === up.varIndex
     }
     pushUp(ctx, up)

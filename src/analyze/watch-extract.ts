@@ -1,15 +1,15 @@
 /**
  * @watch 编译期解析（watch 前移）。
  *
- * 运行时 @watch 装饰器在类定义期用 myfx `get(options, 'deep'/'immediate'/'once')`
- * 逐键解析选项并注册六张 watch 表；这里把「选项解析」移到编译期：
+ * 运行时 @watch 装饰器是 no-op 存根，语义全部由本模块前移：
  *   - 静态解析 @watch(source, options?) → watchEffects 工厂数组注入 __ce_static__，
  *     并从源码中**删除 @watch 装饰器调用**（处理器方法保留）；
  *   - 运行时由 CompElem 构造期 `for (const factory of ceStatic.watchEffects)
  *     effect(factory(this))` 消费 —— 每个工厂产出一个 signal effect，
  *     直接读 `rc.__s.<source>.value` 建立依赖，变更即回调处理器；
  *   - 解析失败（source / options 非静态字面量）→ E-WATCH-ARG（error 级，阻断构建），
- *     此时**不删除装饰器、不注入 watchEffects**，运行时装饰器路径照常兜底。
+ *     此时**不删除装饰器、不注入 watchEffects**（all-or-nothing；构建已被错误阻断，
+ *     运行期装饰器是 no-op，不存在兜底路径）。
  *
  * source 支持形态：字符串字面量、字符串字面量数组、模块级 const 字符串常量
  * （含成员访问，如 EV.TITLE —— 对齐 conventions 的 stringConsts 机制）。
@@ -270,7 +270,7 @@ export function lineSpan(code: string, start: number, end: number): { start: num
 
 /**
  * 提取组件类上全部 @watch 配置。错误（E-WATCH-ARG / E-WATCH-SOURCE）与条目互斥：
- * 有错误时调用方应放弃删除与注入（运行时装饰器路径兜底）。
+ * 有错误时调用方应放弃删除与注入（all-or-nothing；错误已阻断构建，运行期装饰器是 no-op，无兜底）。
  *
  * 只并入**条目**，不并入 removals：祖先在 analyzeFile 里是独立组件，删自己的装饰器。
  */

@@ -330,7 +330,7 @@ export function generateRenderEffect(
       writers.add(entry)
       // 第 5 实参传完整 DirectiveInstance：同一元素可叠多个 TAG 指令（classes+styles+show），
       // __dirNodeMap 按 node 反查会互相覆盖，运行时据实例的 diFn 挑回正确的 UpdatePoint
-      const f = `(rc, nodes, ${P_GET}) => { let ${L_OLD}; return () => { ${depRead}${bodyPrelude(val)}const ${lA('')} = (${val}); if (${lA('')}[1][0] !== ${L_OLD} || rc.__f) { ${entry}(rc, ${nodeOf(up)}, ${lA('')}[1][0], ${L_OLD}, ${lA('')}); ${L_OLD} = ${lA('')}[1][0] } } }`
+      const f = `(rc, nodes, ${P_GET}) => { let ${L_OLD}; return () => { ${depRead}${bodyPrelude(val)}const ${lA('')} = (${val}); ${dirExecStmt(entry, lA(''), nodeOf(up), L_OLD)} } }`
       fast.push(f)
       // fx 返回 DirectiveInstance 供 renderTemplate 首屏执行（与 pointEffects 共用工厂源码）
       fx.push(exprFx(val))
@@ -436,15 +436,27 @@ export function buildSubInliner(
   return { val, prelude }
 }
 
-/** 结构指令点语句（内联取值版）。与 get 版 dirStmt 语义一致，只是 value 由调用方给出。 */
+/**
+ * 指令点执行语句（主模板与子模板两条发射路径共用）。
+ *
+ * 结构指令（execEach/execCond）无条件 exec：回调每轮是新闭包（子模板行参是新对象），
+ * args[0]（条件/集合）不变 ≠ 点内无变化——分支内
+ * 数据靠 exec → REFRESH/UPDATE 换当轮回调刷新，按 args[0] 守卫会把分支数据冻在建树值。
+ * 指令自决 REFRESH/REPLACE/REMOVE/UPDATE，内层按值守卫，无多余 DOM 写入。
+ * execDir 保留守卫：TAG 位 args[0] 即数据本身；slot 的 args[0] 是每轮新函数，引用恒
+ * 不等、恒放行。第三方 TEXT/SLOT 结构指令若 args[0] 稳定仍会被守卫冻住——已知边界。
+ */
+function dirExecStmt(entry: string, a: string, node: string, old: string): string {
+  const exec = `${entry}(rc, ${node}, ${a}[1][0], ${old}, ${a}); ${old} = ${a}[1][0];`
+  if (entry === RC_INTERNAL.execEach || entry === RC_INTERNAL.execCond) return exec
+  return `if (${a}[1][0] !== ${old} || rc.__f) { ${exec} }`
+}
+
+/** 结构指令点语句（内联取值版）。value 由调用方给出。 */
 function dirStmtVal(up: UpOut, a: string, value: string, old: string, writers: WriterSet): string {
   const entry = dirEntryOf(up)
-  const node = `nodes[${up.nodeSn}]`
   writers.add(entry)
-  return (
-    `const ${a} = ${value}; ` +
-    `if (${a}[1][0] !== ${old} || rc.__f) { ${entry}(rc, ${node}, ${a}[1][0], ${old}, ${a}); ${old} = ${a}[1][0] }`
-  )
+  return `const ${a} = ${value}; ${dirExecStmt(entry, a, `nodes[${up.nodeSn}]`, old)}`
 }
 
 /**

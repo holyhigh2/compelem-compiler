@@ -351,7 +351,7 @@ export function extractFieldAccessors(
     } else if (family === 'computed') {
       if (member.type !== 'MethodDefinition' || member.kind !== 'get') {
         // 非 getter 目标由 conventions E-COMPUTED-NOT-GETTER 报告（避免同点重复）；
-        // 此处仅放弃该族——运行时 computed 装饰器仍可兜底。
+        // 此处仅放弃该族（all-or-nothing；错误已阻断构建，运行时 computed 装饰器是 no-op，无兜底）。
         failed.add(family)
         continue
       }

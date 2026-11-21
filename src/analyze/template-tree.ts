@@ -11,21 +11,27 @@
  * 真 rawtext 标签（script/style/xmp...）下的文本是真内容，不解码；
  * 插值值由运行时决定，也不解码。
  *
- * 占位符 token 与 compelem `src/constants.ts` 的 PLACEHOLDER 一致：
- * 解析时以 `⟬Ċ⟭N`（N = Template 序，即源码插值顺序）拼接 quasis，
+ * 占位符 token 与 compelem `src/constants.ts` 的 PLACEHOLDER_OPEN/CLOSE 一致：
+ * 解析时以 `⟬ĊN⟭`（N = Template 序，即源码插值顺序）拼接 quasis，
  * 与运行时 parseTemplate 的编号空间相同 —— 保证 attrTmpl 生成物逐字节可比。
  */
 
 import { decodeEntities } from '../utils/entities'
 
-/** 与 compelem constants.ts PLACEHOLDER 完全一致（⟬ + Ċ + ⟭）。 */
-export const PLACEHOLDER = '⟬Ċ⟭'
+/** 与 compelem constants.ts PLACEHOLDER_OPEN / PLACEHOLDER_CLOSE 完全一致。 */
+export const PLACEHOLDER_OPEN = '⟬Ċ'
+export const PLACEHOLDER_CLOSE = '⟭'
+
+/** 占位符 token（三明治形 ⟬ĊN⟭）：收尾 ⟭ 隔断尾随字面数字，杜绝贪婪 \d+ 粘连索引。 */
+export function placeholderOf(index: number): string {
+  return PLACEHOLDER_OPEN + index + PLACEHOLDER_CLOSE
+}
 
 /** 整段恰为单个占位符（纯插值判定）；group1 = 插值序。消费方：template-dom NAME_TOKEN_RE、render-effect 纯 attr 判定。 */
-export const PLACEHOLDER_ONLY_RE = new RegExp(`^${PLACEHOLDER}(\\d+)$`)
+export const PLACEHOLDER_ONLY_RE = new RegExp(`^${PLACEHOLDER_OPEN}(\\d+)${PLACEHOLDER_CLOSE}$`)
 /** 首个占位符（含前后文的本段混合模板）；group1 = 插值序。 */
-export const PLACEHOLDER_FIRST_RE = new RegExp(`${PLACEHOLDER}(\\d+)`)
-const TOKEN_RE = new RegExp(`${PLACEHOLDER}(\\d+)`, 'g')
+export const PLACEHOLDER_FIRST_RE = new RegExp(`${PLACEHOLDER_OPEN}(\\d+)${PLACEHOLDER_CLOSE}`)
+const TOKEN_RE = new RegExp(`${PLACEHOLDER_OPEN}(\\d+)${PLACEHOLDER_CLOSE}`, 'g')
 
 /** HTML void 元素（不需要闭合标签）。 */
 export const VOID_TAGS = new Set([
@@ -83,12 +89,21 @@ export class TemplateParseError extends Error {
 
 // ---------- 拼接与拆分 ----------
 
-/** quasis + 插值 → 源码级 html 串（插值以 ⟬Ċ⟭N 占位）。 */
+/** quasis + 插值 → 源码级 html 串（插值以 ⟬ĊN⟭ 占位）。 */
 export function buildTemplateHTML(strings: readonly string[]): string {
   let html = ''
   for (let i = 0; i < strings.length; i++) {
+    // 源码字面占位符前缀（含实体解码之外的直接书写）会被运行期 walk 误判为含插值文本，
+    // 而纯静态节点不产 plan 条目 ⇒ 错位消费。与 decodeStatic 的解码守卫对称，直接阻断。
+    const at = strings[i].indexOf(PLACEHOLDER_OPEN)
+    if (at >= 0) {
+      throw new TemplateParseError(
+        '模板源码含字面占位符前缀（⟬Ċ），请改写为插值或更换字符',
+        html.length + at,
+      )
+    }
     html += strings[i]
-    if (i < strings.length - 1) html += PLACEHOLDER + i
+    if (i < strings.length - 1) html += placeholderOf(i)
   }
   return html
 }
@@ -162,17 +177,17 @@ export function parseTemplateTree(
   }
 
   // 静态片段（文本/属性值）的实体解码：只对 static 片段做，var 占位符原样拼回。
-  // 解码结果若出现占位符序列（数字实体可构造 ⟬Ċ⟭），会被误认成插值 → 编译错误。
+  // 解码结果若出现占位符前缀（数字实体可构造 ⟬Ċ），会被误认成插值 → 编译错误。
   const decodeStatic = (raw: string, inAttr: boolean): string => {
     if (raw.indexOf('&') < 0) return raw
     const parts = splitParts(raw)
     if (!parts.some((p) => p.type === 'static' && p.text.indexOf('&') >= 0)) return raw
     return parts
       .map((p) => {
-        if (p.type !== 'static') return `${PLACEHOLDER}${p.index}`
+        if (p.type !== 'static') return placeholderOf(p.index)
         const decoded = decodeEntities(p.text, inAttr)
-        if (decoded.indexOf(PLACEHOLDER) >= 0) {
-          err('HTML 实体解码产生了模板占位符序列（⟬Ċ⟭），请改写实体或改用插值')
+        if (decoded.indexOf(PLACEHOLDER_OPEN) >= 0) {
+          err('HTML 实体解码产生了模板占位符前缀（⟬Ċ），请改写实体或改用插值')
         }
         return decoded
       })
@@ -274,7 +289,7 @@ export function parseTemplateTree(
       for (const a of el.attrs) {
         const nameParts = splitParts(a.name)
         const nameVars = nameParts.filter((p): p is TVarPart => p.type === 'var')
-        if (nameVars.length > 1 || (nameVars.length === 1 && a.name !== PLACEHOLDER + nameVars[0].index)) {
+        if (nameVars.length > 1 || (nameVars.length === 1 && a.name !== placeholderOf(nameVars[0].index))) {
           err(`属性名 ${a.name} 只允许整体为一个插值（标签位指令写法），不允许部分插值`)
         }
         const valVars = a.parts.filter((p): p is TVarPart => p.type === 'var').length
